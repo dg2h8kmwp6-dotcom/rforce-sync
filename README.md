@@ -85,6 +85,8 @@ php artisan rforce:sync --inline
 | `php artisan rforce:query "<SOQL>"`              | Stream the records produced by an ad-hoc SOQL to stdout. No DB writes. |
 | `php artisan rforce:run-query <id\|name>`        | Sync a single saved QueryDefinition. Add `--inline`, `--dry-run`, `--since=…`, `--limit=…` as needed. |
 | `php artisan rforce:sync`                        | Sync every enabled QueryDefinition. Add `--inline` or `--dry-run`. |
+| `php artisan rforce:cleanup-stale-runs`          | Mark stuck "running" SyncRuns as failed after the configured staleness window (default 2h). Scheduled every 15 min. |
+| `php artisan rforce:health [--json]`             | Operational diagnostic: DB, queue, gateway config, enabled queries, last success, stale-run count. Returns non-zero on fail. |
 
 ## Example test query
 
@@ -118,8 +120,13 @@ SELECT FIELDS(ALL) FROM Order WHERE LastModifiedDate > {{last_sync_at}}
   Cloud secret manager. Never commit them.
 - Release hook: `php artisan migrate --force`. The seeder is idempotent and
   safe to re-run if you want SOQL changes shipped via code review.
-- Add a queue worker process (`php artisan queue:work`) for
-  `RunQueryDefinitionJob` + `TransformRForceRecordsJob`.
-- Add a `php artisan schedule:run` cron so per-`QueryDefinition` schedules
-  defined in `routes/console.php` fire.
-- Health check: point Laravel Cloud at `/up`.
+- **Queue worker (required).** Run `php artisan queue:work --queue=$RFORCE_QUEUE`
+  as a long-lived process. SyncRun completion depends on the worker
+  picking up `TransformRForceRecordsJob`; without one, runs stick in
+  `running` until `rforce:cleanup-stale-runs` fails them.
+- Add a `php artisan schedule:run` cron (once a minute) so per-
+  `QueryDefinition` schedules and `rforce:cleanup-stale-runs` (every 15
+  minutes) fire.
+- **Synthetic monitor.** Schedule `rforce:health --json` on your alerting
+  system; treat exit code != 0 (or `"ok": false`) as paging-worthy.
+- App health: point Laravel Cloud at `/up`.

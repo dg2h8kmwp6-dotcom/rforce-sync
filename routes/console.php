@@ -48,6 +48,12 @@ try {
     // DB not reachable (e.g. during initial install). Schedule fixed jobs only.
 }
 
+// Self-heal SyncRuns that got stuck because a queue worker died mid-flight.
+// Runs every 15 minutes; the command is a no-op when nothing is stale.
+Schedule::command('rforce:cleanup-stale-runs')
+    ->everyFifteenMinutes()
+    ->withoutOverlapping();
+
 Schedule::command('sheets:export accounts')
     ->dailyAt('06:00')
     ->withoutOverlapping();

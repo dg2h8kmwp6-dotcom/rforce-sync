@@ -11,6 +11,7 @@ use App\Models\SyncRun;
 use App\Services\Sync\SyncRunManager;
 use DateTimeInterface;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
@@ -67,6 +68,18 @@ class RForceSyncManager
         try {
             foreach ($this->executor->executePaginated($soql) as $page) {
                 $records = $page->records;
+
+                // Pagination telemetry. Never logs credentials, SOQL bodies,
+                // or record payloads — only pointers and counts.
+                Log::info('rforce.pagination.page', [
+                    'sync_run_id'         => $run->id,
+                    'query_definition_id' => $definition->id,
+                    'page_number'         => $page->pageNumber,
+                    'records'             => count($records),
+                    'has_next'            => $page->nextRecordsUrl !== null,
+                    'done'                => $page->done,
+                ]);
+
                 $this->runs->incrementReceived($run, count($records));
 
                 if ($dryRun) {

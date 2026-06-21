@@ -7,6 +7,8 @@ namespace App\Services\RForce;
 use App\Services\RForce\Contracts\RForceConnector;
 use App\Services\RForce\DTO\RForceQueryResult;
 use App\Services\RForce\Exceptions\RForceException;
+use App\Services\RForce\Pagination\HeaderBasedPaginationStrategy;
+use App\Services\RForce\Pagination\PaginationStrategyInterface;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Http\Client\PendingRequest;
@@ -28,8 +30,8 @@ use Throwable;
  *
  *     { totalSize, done, nextRecordsUrl?, records: [...] }
  *
- * Pagination uses the `nextRecordsUrl` from the previous response, sent back
- * as a header (no `q` parameter) per the gateway docs.
+ * Pagination delegates to a PaginationStrategyInterface so the on-the-wire
+ * shape (header vs query parameter) is swappable without touching transport.
  */
 class RForceClient implements RForceConnector
 {
@@ -51,6 +53,7 @@ class RForceClient implements RForceConnector
         private readonly HttpFactory $http,
         private readonly string $baseUrl,
         private readonly array $config,
+        private readonly PaginationStrategyInterface $pagination = new HeaderBasedPaginationStrategy(),
     ) {}
 
     public function ping(): bool
@@ -69,16 +72,22 @@ class RForceClient implements RForceConnector
             $req->get($this->baseUrl, ['q' => $soql])
         );
 
-        return $this->parse($response, context: ['soql' => $soql]);
+        return $this->parse($response);
     }
 
     public function queryMore(string $nextRecordsUrl): RForceQueryResult
     {
-        $response = $this->send(fn (PendingRequest $req): Response =>
-            $req->withHeaders(['nextRecordsUrl' => $nextRecordsUrl])->get($this->baseUrl)
-        );
+        $response = $this->send(function (PendingRequest $req) use ($nextRecordsUrl): Response {
+            [$prepared, $queryParams] = $this->pagination->applyTo($req, $nextRecordsUrl);
+            return $prepared->get($this->baseUrl, $queryParams);
+        });
 
-        return $this->parse($response, context: ['nextRecordsUrl' => $nextRecordsUrl]);
+        return $this->parse($response);
+    }
+
+    public function paginationStrategyName(): string
+    {
+        return $this->pagination->name();
     }
 
     /**
@@ -112,8 +121,6 @@ class RForceClient implements RForceConnector
             throw new RForceException('Data Gateway request failed: '.$e->getMessage(), 0, $e);
         }
 
-        // Manual retry on transient HTTP statuses (Http::retry only retries on
-        // transport exceptions when `throw=false`, not on bad statuses).
         $attempts = 1;
         while ($attempts < $retryAttempts && in_array($response->status(), $retryWhen, true)) {
             usleep($retrySleep * 1000);
@@ -149,10 +156,7 @@ class RForceClient implements RForceConnector
         return $headers;
     }
 
-    /**
-     * @param  array<string,mixed>  $context
-     */
-    private function parse(Response $response, array $context = []): RForceQueryResult
+    private function parse(Response $response): RForceQueryResult
     {
         if (! $response->successful()) {
             throw new RForceException(sprintf(

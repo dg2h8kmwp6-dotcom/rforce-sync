@@ -84,19 +84,15 @@ Salesforce REST style, returned verbatim by MuleSoft:
 }
 ```
 
-### Pagination — `nextRecordsUrl` header
+### Pagination — `nextRecordsUrl`
 
 When `done` is `false`, the next page is fetched by hitting the same gateway
 URL again, this time with the `nextRecordsUrl` from the previous response
-sent **as a header** (no `q` parameter):
+passed along.
 
-```http
-GET {RFORCE_BASE_URL}
-nextRecordsUrl: /services/data/v60.0/query/01g4000000ABCDe-2000
-```
-
-This behavior is encapsulated in `RForceClient::queryMore()` so it can be
-adjusted in one place if the gateway contract evolves.
+The on-the-wire encoding is selected by `RFORCE_PAGINATION_MODE` and lives
+behind `App\Services\RForce\Pagination\PaginationStrategyInterface`. See
+[Pagination Strategy](#pagination-strategy) below.
 
 ## Component Map
 
@@ -142,6 +138,51 @@ adjusted in one place if the gateway contract evolves.
 │  normalized_accounts / contacts / opportunities (optional)     │
 └────────────────────────────────────────────────────────────────┘
 ```
+
+## Pagination Strategy
+
+Pagination is configurable, not hard-coded. The gateway docs (PDF +
+screenshots) describe a header-based handoff, which is the default. If a
+gateway environment turns out to expect a query-string parameter instead,
+the strategy is swappable without touching transport code.
+
+```
+PaginationStrategyInterface
+ ├── HeaderBasedPaginationStrategy   (default, RFORCE_PAGINATION_MODE=header)
+ └── QueryParameterPaginationStrategy            (RFORCE_PAGINATION_MODE=query_parameter)
+```
+
+### Header mode (default)
+
+```http
+GET {RFORCE_BASE_URL}
+nextRecordsUrl: /services/data/v60.0/query/01g4000000ABCDe-2000
+```
+
+### Query parameter mode
+
+```http
+GET {RFORCE_BASE_URL}?nextRecordsUrl=/services/data/v60.0/query/01g4000000ABCDe-2000
+```
+
+In both modes the parameter name defaults to `nextRecordsUrl`; override
+with `RFORCE_PAGINATION_PARAM`. The first page of a query (`query()`) is
+always sent as `?q=<SOQL>` regardless of mode — only subsequent
+`queryMore()` calls go through the strategy.
+
+### Pagination telemetry
+
+`RForceSyncManager` logs one `rforce.pagination.page` info entry per page
+with:
+
+- `sync_run_id`
+- `query_definition_id`
+- `page_number`
+- `records` (count)
+- `has_next` (boolean — whether the gateway returned a nextRecordsUrl)
+- `done` (boolean)
+
+Credentials, SOQL bodies, and record payloads are never logged.
 
 ## Sync Lifecycle
 
@@ -197,10 +238,20 @@ TransformRForceRecordsJob.handle(runs)
         └── SyncRunManager.finish()  (status derived; duration_ms set)
 ```
 
-**Failure handling.** Any throw inside `RForceSyncManager.sync()` is captured
-as a `gateway`-category `SyncError`, the run is marked `failed`, and the job
-re-throws. Transformer failures are bucketed per-record (run is partial, not
-failed) unless the chunk pipeline itself blows up.
+**Failure handling.** A SyncRun reaches a terminal state from one of four
+paths:
+
+| failure mode                       | who fails the run? |
+|------------------------------------|---|
+| `RForceSyncManager::sync()` throws (HTTP/timeout/SOQL/auth/pagination/etc.) | `sync()` itself records a `gateway`-category SyncError, calls `runs->fail()`, then re-throws |
+| `TransformRForceRecordsJob` throws | the job records a `transform`-category SyncError, calls `runs->fail()`, then re-throws |
+| `TransformRForceRecordsJob::dispatch()` throws (queue down, serialization) | `RunQueryDefinitionJob` records a `dispatch`-category SyncError, calls `runs->fail()`, then re-throws |
+| Worker crashes before transform completes | `rforce:cleanup-stale-runs` (cron) catches the run after `RFORCE_STALE_AFTER_HOURS` and fails it with a `stale`-category SyncError |
+
+The last row is the safety net for the queue dependency described below.
+
+Transformer per-record failures stay inside `transformBatch()` and are
+bucketed per-record (run is `partial`, not `failed`).
 
 **Idempotency.** Re-running a definition is safe at every layer:
 
@@ -208,6 +259,39 @@ failed) unless the chunk pipeline itself blows up.
   `upsert()`. Salesforce Ids are globally unique within a source.
 - Hash comparison means an unchanged payload is a `last_seen_at` touch only.
 - Normalized rows use `updateOrCreate` keyed on `(source, external_id)`.
+
+## Queue Dependency
+
+`RunQueryDefinitionJob` does the gateway fetch + raw upsert, then
+**dispatches** `TransformRForceRecordsJob`. Completion of a run is therefore
+queue-dependent: if no worker picks up the transform job, the SyncRun
+remains in `running` until something fails it.
+
+What the platform does about that:
+
+1. **Inline dispatch failures** (queue manager throws when pushing the job)
+   are caught in `RunQueryDefinitionJob` — the run is failed with a
+   `dispatch`-category SyncError before the exception propagates.
+2. **Workers that never run the transform** (queue paused, worker crashed,
+   wrong queue name) leave the run stuck. `rforce:cleanup-stale-runs`
+   runs every 15 minutes via the scheduler and fails any run still in
+   `running` after `RFORCE_STALE_AFTER_HOURS` (default 2h).
+3. **Observability**: `rforce:health` reports the current stuck-run count
+   alongside DB / queue / gateway / last-success diagnostics.
+
+### Health-check guidance
+
+For deployment monitors:
+
+- Run `rforce:health --json` from your synthetic check; treat `ok: false`
+  as a failed health probe.
+- Run `php artisan queue:work --queue=$RFORCE_QUEUE` as a long-lived
+  process. **Without a worker the platform cannot complete a sync.**
+- Schedule `rforce:cleanup-stale-runs` (already wired in
+  `routes/console.php`) so a worker-less window self-heals after the
+  staleness window expires instead of silently rotting.
+- Watch `sync_errors.category = 'stale'` — repeated entries mean a worker
+  isn't picking up jobs and on-call should be paged.
 
 ## Query Lifecycle
 
@@ -281,6 +365,40 @@ into SOQL** — only typed values produced by the placeholder resolver.
                                   ▼
                             Google Sheets (optional)
 ```
+
+## Operational Commands
+
+| command                                | purpose | safe to schedule? |
+|----------------------------------------|---------|-------------------|
+| `php artisan rforce:test-connection`   | Verify gateway reachability + credentials (one real SOQL call). | no — manual probe |
+| `php artisan rforce:query "<SOQL>"`    | Stream the records produced by an ad-hoc SOQL. No DB writes. | no — manual probe |
+| `php artisan rforce:run-query <id\|name>` | Sync a single saved QueryDefinition. `--inline`, `--dry-run`, `--since=…`, `--limit=…` supported. | yes (per-definition) |
+| `php artisan rforce:sync`              | Sync every enabled QueryDefinition. | yes |
+| `php artisan rforce:cleanup-stale-runs` | Fail any SyncRun stuck in `running` past the staleness threshold. Already scheduled every 15 minutes. | yes (already cron'd) |
+| `php artisan rforce:health [--json]`   | Diagnostic snapshot: DB, queue, gateway config, enabled queries, last success, stale-run count. Returns non-zero on `fail`. | yes (alerting probe) |
+
+### `rforce:health` output
+
+Human mode (default) shows one line per check with `[ ok ]` / `[warn]` /
+`[fail]` plus a `Overall: healthy|failing` summary. `--json` emits a
+machine-readable payload:
+
+```json
+{
+  "ok": true,
+  "checks": {
+    "database":       { "status": "ok",   "message": "connected", "detail": { "driver": "mysql", "latency_ms": 3 } },
+    "queue":          { "status": "ok",   "message": "reachable", "detail": { "connection": "database", "queue": "default", "pending": 0 } },
+    "gateway_config": { "status": "ok",   "message": "configured", "detail": { "environment": "stage", "base_url": "...", "sf_version": "v60.0", "pagination_mode": "header" } },
+    "query_defs":     { "status": "ok",   "message": "2 enabled of 2", "detail": { "enabled": 2, "total": 2 } },
+    "last_success":   { "status": "ok",   "message": "2026-06-21T14:00:00+00:00", "detail": { "sync_run_id": 123, "query_definition_id": 7, "age_hours": 1 } },
+    "stale_runs":     { "status": "ok",   "message": "none stuck > 2h", "detail": { "stale_after_hours": 2, "count": 0 } }
+  }
+}
+```
+
+The command never calls the gateway — it's safe to run on a misconfigured
+environment and won't burn MuleSoft quota.
 
 ## Database Schema Overview
 

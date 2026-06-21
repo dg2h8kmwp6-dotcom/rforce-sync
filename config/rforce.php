@@ -85,6 +85,32 @@ return [
         'queue'       => env('RFORCE_QUEUE', 'default'),
         // Identifier used to tag rows in `external_sources`.
         'source_name' => 'rforce',
+        // A SyncRun is considered "stale" if it is still status=running this
+        // long after started_at. The cleanup command marks stale runs as
+        // failed so they don't pin counters/dashboards forever when a queue
+        // worker drops a job mid-flight. Default: 2 hours.
+        'stale_after_hours' => (int) env('RFORCE_STALE_AFTER_HOURS', 2),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Pagination
+    |--------------------------------------------------------------------------
+    |
+    | How the connector hands the gateway a `nextRecordsUrl` from the previous
+    | page. Header mode mirrors the gateway docs (as inferred from the PDF +
+    | screenshots); query_parameter mode is a fallback if the header contract
+    | turns out to be wrong in some environment.
+    |
+    | Switch with RFORCE_PAGINATION_MODE=header | query_parameter.
+    |
+    */
+
+    'pagination' => [
+        'mode' => env('RFORCE_PAGINATION_MODE', 'header'),
+        // Name of the header / query string key used to send the next page
+        // pointer. Defaults match the gateway docs.
+        'param_name' => env('RFORCE_PAGINATION_PARAM', 'nextRecordsUrl'),
     ],
 
     /*
