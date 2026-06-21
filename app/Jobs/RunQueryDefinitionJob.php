@@ -47,27 +47,22 @@ class RunQueryDefinitionJob implements ShouldQueue
 
         $since = $this->since !== null ? new \DateTimeImmutable($this->since) : null;
 
-        try {
-            $run = $sync->sync(
-                definition: $definition,
-                since:      $since,
-                limit:      $this->limit,
-                dryRun:     $this->dryRun,
-                meta:       $this->meta,
-            );
+        $run = $sync->sync(
+            definition: $definition,
+            since:      $since,
+            limit:      $this->limit,
+            dryRun:     $this->dryRun,
+            meta:       $this->meta,
+        );
 
-            if ($this->dryRun) {
-                $runs->finish($run);
-                return;
-            }
-
-            // Normalization runs in a separate job so it can be retried
-            // without re-fetching from the gateway.
-            TransformRForceRecordsJob::dispatch($run->id);
-        } catch (Throwable $e) {
-            // RForceSyncManager already records the error + fails the run.
-            throw $e;
+        if ($this->dryRun) {
+            $runs->finish($run);
+            return;
         }
+
+        // Normalization runs in a separate job so it can be retried
+        // without re-fetching from the gateway.
+        TransformRForceRecordsJob::dispatch($run->id);
     }
 
     public function failed(Throwable $e): void

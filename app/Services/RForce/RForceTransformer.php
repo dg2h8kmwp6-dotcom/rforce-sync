@@ -91,7 +91,7 @@ abstract class RForceTransformer
             } catch (\Throwable $e) {
                 $fail++;
                 $run->errors()->create([
-                    'object_type' => $raw->object_type,
+                    'object_type' => $raw->source_object_type,
                     'external_id' => $raw->external_id,
                     'category'    => 'transform',
                     'message'     => $e->getMessage(),

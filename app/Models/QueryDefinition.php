@@ -18,7 +18,7 @@ class QueryDefinition extends Model
         'name',
         'description',
         'soql',
-        'target_object',
+        'target_dataset',
         'transformer_class',
         'enabled',
         'schedule',
@@ -46,8 +46,8 @@ class QueryDefinition extends Model
     }
 
     /**
-     * Resolve the transformer to use for normalizing this query's rows.
-     * Falls back to config('rforce.objects.{target_object}.transformer').
+     * Resolve the transformer to use for this query's rows.
+     * Falls back to config('rforce.datasets.{target_dataset}.transformer').
      */
     public function resolvedTransformerClass(): ?string
     {
@@ -55,11 +55,11 @@ class QueryDefinition extends Model
             return $this->transformer_class;
         }
 
-        if ($this->target_object === null) {
+        if ($this->target_dataset === null) {
             return null;
         }
 
-        $configured = config("rforce.objects.{$this->target_object}.transformer");
+        $configured = config("rforce.datasets.{$this->target_dataset}.transformer");
         return is_string($configured) && class_exists($configured) ? $configured : null;
     }
 }

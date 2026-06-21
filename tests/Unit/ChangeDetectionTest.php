@@ -7,7 +7,7 @@ namespace Tests\Unit;
 use App\Models\QueryDefinition;
 use App\Models\RawRforceRecord;
 use App\Services\RForce\Contracts\RForceConnector;
-use App\Services\RForce\DTO\QueryResult;
+use App\Services\RForce\DTO\RForceQueryResult;
 use App\Services\RForce\RForceQueryExecutor;
 use App\Services\RForce\RForceSyncManager;
 use App\Services\Sync\SyncRunManager;
@@ -20,10 +20,8 @@ class ChangeDetectionTest extends TestCase
 
     public function test_payload_hash_is_deterministic_for_identical_records(): void
     {
-        $a = RForceSyncManager::extractExternalId(['Id' => 'A1']);
         $hashA = hash('sha256', json_encode(['Id' => 'A1', 'Name' => 'Acme']));
         $hashB = hash('sha256', json_encode(['Id' => 'A1', 'Name' => 'Acme']));
-        $this->assertSame('A1', $a);
         $this->assertSame($hashA, $hashB);
     }
 
@@ -32,9 +30,9 @@ class ChangeDetectionTest extends TestCase
         [$sync, $runs] = $this->makeSync();
         $definition = $this->makeDef();
         $source = $definition->externalSource;
-        $run = $runs->start($source, 'Account');
+        $run = $runs->start($source, 'accounts');
 
-        $diff = $sync->upsertWithChangeDetection($source, $definition, $run, 'Account', [
+        $diff = $sync->upsertWithChangeDetection($source, $definition, $run, [
             ['Id' => 'A1', 'Name' => 'Acme'],
             ['Id' => 'A2', 'Name' => 'Globex'],
         ]);
@@ -48,14 +46,37 @@ class ChangeDetectionTest extends TestCase
         $this->assertSame($row->first_seen_at->toIso8601String(), $row->last_seen_at->toIso8601String());
     }
 
+    public function test_attributes_block_populates_source_object_type_and_source_url(): void
+    {
+        [$sync, $runs] = $this->makeSync();
+        $definition = $this->makeDef();
+        $source = $definition->externalSource;
+        $run = $runs->start($source, 'accounts');
+
+        $sync->upsertWithChangeDetection($source, $definition, $run, [
+            [
+                'attributes' => [
+                    'type' => 'Account',
+                    'url'  => '/services/data/v60.0/sobjects/Account/001abc',
+                ],
+                'Id'   => 'A1',
+                'Name' => 'Acme',
+            ],
+        ]);
+
+        $row = RawRforceRecord::query()->where('external_id', 'A1')->firstOrFail();
+        $this->assertSame('Account', $row->source_object_type);
+        $this->assertSame('/services/data/v60.0/sobjects/Account/001abc', $row->source_url);
+    }
+
     public function test_second_sync_buckets_unchanged_vs_changed_vs_new(): void
     {
         [$sync, $runs] = $this->makeSync();
         $definition = $this->makeDef();
         $source = $definition->externalSource;
-        $run1 = $runs->start($source, 'Account');
+        $run1 = $runs->start($source, 'accounts');
 
-        $sync->upsertWithChangeDetection($source, $definition, $run1, 'Account', [
+        $sync->upsertWithChangeDetection($source, $definition, $run1, [
             ['Id' => 'A1', 'Name' => 'Acme'],
             ['Id' => 'A2', 'Name' => 'Globex'],
         ]);
@@ -66,8 +87,8 @@ class ChangeDetectionTest extends TestCase
         // Force a clock gap so last_seen_at clearly moves forward.
         sleep(1);
 
-        $run2 = $runs->start($source, 'Account');
-        $diff = $sync->upsertWithChangeDetection($source, $definition, $run2, 'Account', [
+        $run2 = $runs->start($source, 'accounts');
+        $diff = $sync->upsertWithChangeDetection($source, $definition, $run2, [
             ['Id' => 'A1', 'Name' => 'Acme Updated'],   // changed
             ['Id' => 'A2', 'Name' => 'Globex'],          // unchanged
             ['Id' => 'A3', 'Name' => 'Initech'],         // new
@@ -86,9 +107,9 @@ class ChangeDetectionTest extends TestCase
         [$sync, $runs] = $this->makeSync();
         $definition = $this->makeDef();
         $source = $definition->externalSource;
-        $run = $runs->start($source, 'Account');
+        $run = $runs->start($source, 'accounts');
 
-        $diff = $sync->upsertWithChangeDetection($source, $definition, $run, 'Account', [
+        $diff = $sync->upsertWithChangeDetection($source, $definition, $run, [
             ['Name' => 'No id at all'],
             ['Id' => 'A1', 'Name' => 'Has id'],
         ]);
@@ -104,9 +125,13 @@ class ChangeDetectionTest extends TestCase
         // Connector unused in upsertWithChangeDetection; pass a stub.
         $stub = new class implements RForceConnector {
             public function ping(): bool { return true; }
-            public function executeSoql(string $soql, ?string $cursor = null, ?int $pageSize = null): QueryResult
+            public function query(string $soql): RForceQueryResult
             {
-                return new QueryResult([], null);
+                return new RForceQueryResult(0, true, null, []);
+            }
+            public function queryMore(string $nextRecordsUrl): RForceQueryResult
+            {
+                return new RForceQueryResult(0, true, null, []);
             }
         };
         $runs = new SyncRunManager();
@@ -121,7 +146,7 @@ class ChangeDetectionTest extends TestCase
             'external_source_id' => $source->id,
             'name'               => 'accounts.all',
             'soql'               => 'SELECT Id, Name FROM Account',
-            'target_object'      => 'Account',
+            'target_dataset'     => 'accounts',
             'enabled'            => true,
         ]);
     }

@@ -11,7 +11,7 @@ use App\Models\QueryDefinition;
 use App\Models\RawRforceRecord;
 use App\Models\SyncRun;
 use App\Services\RForce\Contracts\RForceConnector;
-use App\Services\RForce\DTO\QueryResult;
+use App\Services\RForce\DTO\RForceQueryResult;
 use App\Services\RForce\Exceptions\RForceException;
 use App\Services\RForce\RForceSyncManager;
 use App\Services\Sync\SyncRunManager;
@@ -26,19 +26,13 @@ class RunQueryDefinitionJobTest extends TestCase
     public function test_full_pipeline_writes_raw_and_normalized_and_marks_succeeded(): void
     {
         $this->bindFakeConnector([
-            new QueryResult(
-                records: [
-                    ['Id' => 'A1', 'Name' => 'Acme',   'Industry' => 'Manufacturing', 'LastModifiedDate' => '2026-05-01T00:00:00Z'],
-                    ['Id' => 'A2', 'Name' => 'Globex', 'Industry' => 'Energy',        'LastModifiedDate' => '2026-05-02T00:00:00Z'],
-                ],
-                nextCursor: 'p2',
-            ),
-            new QueryResult(
-                records: [
-                    ['Id' => 'A3', 'Name' => 'Initech', 'Industry' => 'Software', 'LastModifiedDate' => '2026-05-03T00:00:00Z'],
-                ],
-                nextCursor: null,
-            ),
+            new RForceQueryResult(3, false, '/q/p2', [
+                ['Id' => 'A1', 'Name' => 'Acme',   'Industry' => 'Manufacturing', 'LastModifiedDate' => '2026-05-01T00:00:00Z'],
+                ['Id' => 'A2', 'Name' => 'Globex', 'Industry' => 'Energy',        'LastModifiedDate' => '2026-05-02T00:00:00Z'],
+            ]),
+            new RForceQueryResult(3, true, null, [
+                ['Id' => 'A3', 'Name' => 'Initech', 'Industry' => 'Software', 'LastModifiedDate' => '2026-05-03T00:00:00Z'],
+            ]),
         ]);
 
         $definition = $this->seedDefinition();
@@ -65,12 +59,39 @@ class RunQueryDefinitionJobTest extends TestCase
         $this->assertNotNull($a1->last_synced_at);
     }
 
+    public function test_pagination_uses_next_records_url(): void
+    {
+        $this->bindFakeConnector([
+            new RForceQueryResult(6, false, '/q/p2', [['Id' => 'A1'], ['Id' => 'A2']]),
+            new RForceQueryResult(6, false, '/q/p3', [['Id' => 'A3'], ['Id' => 'A4']]),
+            new RForceQueryResult(6, true,  null,    [['Id' => 'A5'], ['Id' => 'A6']]),
+        ]);
+
+        $definition = $this->seedDefinition();
+
+        (new RunQueryDefinitionJob($definition->id))->handle(
+            app(RForceSyncManager::class),
+            app(SyncRunManager::class),
+        );
+
+        $this->assertSame(6, RawRforceRecord::query()->count());
+        $run = SyncRun::query()->latest('id')->firstOrFail();
+        $this->assertSame(6, $run->records_received);
+
+        // First call is query(), next two via queryMore() with the URL the
+        // previous page returned.
+        /** @var \Tests\Feature\Jobs\FakeMuleSoftConnector $connector */
+        $connector = app(RForceConnector::class);
+        $this->assertCount(1, $connector->queryCalls);
+        $this->assertSame(['/q/p2', '/q/p3'], $connector->queryMoreCalls);
+    }
+
     public function test_rerun_buckets_changes_correctly(): void
     {
         $definition = $this->seedDefinition();
 
         $this->bindFakeConnector([
-            new QueryResult([['Id' => 'A1', 'Name' => 'Acme'], ['Id' => 'A2', 'Name' => 'Globex']], null),
+            new RForceQueryResult(2, true, null, [['Id' => 'A1', 'Name' => 'Acme'], ['Id' => 'A2', 'Name' => 'Globex']]),
         ]);
         (new RunQueryDefinitionJob($definition->id))->handle(
             app(RForceSyncManager::class),
@@ -78,11 +99,11 @@ class RunQueryDefinitionJobTest extends TestCase
         );
 
         $this->bindFakeConnector([
-            new QueryResult([
+            new RForceQueryResult(3, true, null, [
                 ['Id' => 'A1', 'Name' => 'Acme Updated'],  // changed
                 ['Id' => 'A2', 'Name' => 'Globex'],        // unchanged
                 ['Id' => 'A3', 'Name' => 'Initech'],       // new
-            ], null),
+            ]),
         ]);
         (new RunQueryDefinitionJob($definition->id))->handle(
             app(RForceSyncManager::class),
@@ -100,9 +121,13 @@ class RunQueryDefinitionJobTest extends TestCase
     {
         $this->app->instance(RForceConnector::class, new class implements RForceConnector {
             public function ping(): bool { return true; }
-            public function executeSoql(string $soql, ?string $cursor = null, ?int $pageSize = null): QueryResult
+            public function query(string $soql): RForceQueryResult
             {
-                throw new RForceException('HTTP 503 from gateway');
+                throw new RForceException('Data Gateway returned HTTP 503: busy');
+            }
+            public function queryMore(string $nextRecordsUrl): RForceQueryResult
+            {
+                throw new RForceException('Data Gateway returned HTTP 503: busy');
             }
         });
 
@@ -128,7 +153,7 @@ class RunQueryDefinitionJobTest extends TestCase
     public function test_dry_run_streams_pages_but_does_not_persist(): void
     {
         $this->bindFakeConnector([
-            new QueryResult([['Id' => 'A1', 'Name' => 'Acme']], null),
+            new RForceQueryResult(1, true, null, [['Id' => 'A1', 'Name' => 'Acme']]),
         ]);
 
         $definition = $this->seedDefinition();
@@ -147,40 +172,19 @@ class RunQueryDefinitionJobTest extends TestCase
         $this->assertTrue(($run->meta['dry_run'] ?? false));
     }
 
-    public function test_paginated_query_walks_all_pages(): void
-    {
-        // 3 pages of 2 records each.
-        $this->bindFakeConnector([
-            new QueryResult([['Id' => 'A1'], ['Id' => 'A2']], 'p2'),
-            new QueryResult([['Id' => 'A3'], ['Id' => 'A4']], 'p3'),
-            new QueryResult([['Id' => 'A5'], ['Id' => 'A6']], null),
-        ]);
-
-        $definition = $this->seedDefinition();
-
-        (new RunQueryDefinitionJob($definition->id))->handle(
-            app(RForceSyncManager::class),
-            app(SyncRunManager::class),
-        );
-
-        $this->assertSame(6, RawRforceRecord::query()->count());
-        $run = SyncRun::query()->latest('id')->firstOrFail();
-        $this->assertSame(6, $run->records_received);
-    }
-
-    public function test_missing_transformer_marks_run_failed_without_blowing_up(): void
+    public function test_missing_transformer_finishes_without_normalizing(): void
     {
         $source = app(SyncRunManager::class)->defaultSource();
         $definition = QueryDefinition::query()->create([
             'external_source_id' => $source->id,
-            'name'               => 'unknown.thing',
-            'soql'               => 'SELECT Id FROM UnknownObject__c',
-            'target_object'      => 'UnknownObject__c',
+            'name'               => 'orders.incremental',
+            'soql'               => 'SELECT FIELDS(ALL) FROM Order LIMIT 100',
+            'target_dataset'     => 'orders',
             'enabled'            => true,
         ]);
 
         $this->bindFakeConnector([
-            new QueryResult([['Id' => 'X1']], null),
+            new RForceQueryResult(1, true, null, [['Id' => 'X1']]),
         ]);
 
         (new RunQueryDefinitionJob($definition->id))->handle(
@@ -188,9 +192,13 @@ class RunQueryDefinitionJobTest extends TestCase
             app(SyncRunManager::class),
         );
 
+        // Raw rows persist; no normalized table; run is healthy.
+        $this->assertSame(1, RawRforceRecord::query()->count());
         $run = SyncRun::query()->latest('id')->firstOrFail();
-        $this->assertSame(SyncStatus::Failed, $run->status);
-        $this->assertSame(1, $run->errors->where('category', 'config')->count());
+        $this->assertSame(SyncStatus::Succeeded, $run->status);
+
+        $raw = RawRforceRecord::query()->firstOrFail();
+        $this->assertNotNull($raw->last_synced_at);
     }
 
     private function seedDefinition(): QueryDefinition
@@ -200,25 +208,45 @@ class RunQueryDefinitionJobTest extends TestCase
             'external_source_id' => $source->id,
             'name'               => 'accounts.all',
             'soql'               => 'SELECT Id, Name FROM Account',
-            'target_object'      => 'Account',
+            'target_dataset'     => 'accounts',
             'enabled'            => true,
         ]);
     }
 
-    /** @param  array<int, QueryResult>  $pages */
+    /** @param  array<int, RForceQueryResult>  $pages */
     private function bindFakeConnector(array $pages): void
     {
-        $this->app->instance(RForceConnector::class, new class($pages) implements RForceConnector {
-            /** @param  array<int, QueryResult>  $pages */
-            public function __construct(private array $pages, private int $cursor = 0) {}
-            public function ping(): bool { return true; }
-            public function executeSoql(string $soql, ?string $cursor = null, ?int $pageSize = null): QueryResult
-            {
-                if ($this->cursor >= count($this->pages)) {
-                    throw new RuntimeException('Fake connector exhausted.');
-                }
-                return $this->pages[$this->cursor++];
-            }
-        });
+        $this->app->instance(RForceConnector::class, new FakeMuleSoftConnector($pages));
+    }
+}
+
+final class FakeMuleSoftConnector implements RForceConnector
+{
+    public array $queryCalls = [];
+    public array $queryMoreCalls = [];
+
+    /** @param array<int, RForceQueryResult> $pages */
+    public function __construct(private array $pages, private int $cursor = 0) {}
+
+    public function ping(): bool { return true; }
+
+    public function query(string $soql): RForceQueryResult
+    {
+        $this->queryCalls[] = $soql;
+        return $this->next();
+    }
+
+    public function queryMore(string $nextRecordsUrl): RForceQueryResult
+    {
+        $this->queryMoreCalls[] = $nextRecordsUrl;
+        return $this->next();
+    }
+
+    private function next(): RForceQueryResult
+    {
+        if ($this->cursor >= count($this->pages)) {
+            throw new RuntimeException('Fake connector exhausted.');
+        }
+        return $this->pages[$this->cursor++];
     }
 }

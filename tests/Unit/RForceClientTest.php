@@ -4,118 +4,178 @@ declare(strict_types=1);
 
 namespace Tests\Unit;
 
-use App\Services\RForce\RForceAuthenticator;
+use App\Services\RForce\Exceptions\RForceException;
 use App\Services\RForce\RForceClient;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
-use Mockery;
 use Tests\TestCase;
 
 class RForceClientTest extends TestCase
 {
-    protected function tearDown(): void
-    {
-        Mockery::close();
-        parent::tearDown();
-    }
+    private const URL = 'https://gw.example/api/rforce/control-layer/query';
 
-    private function client(int $retryAttempts = 1): RForceClient
+    private function client(array $overrides = []): RForceClient
     {
-        $auth = Mockery::mock(RForceAuthenticator::class);
-        $auth->shouldReceive('token')->andReturn('test-token');
+        $config = array_merge([
+            'proxy_client_id'     => 'PROXY_ID',
+            'proxy_client_secret' => 'PROXY_SECRET',
+            'sf_client_id'        => 'SF_ID',
+            'sf_client_secret'    => 'SF_SECRET',
+            'sf_version'          => 'v60.0',
+            'sf_environment_url'  => null,
+            'timeout'             => 5,
+            'retry_attempts'      => 1,
+            'retry_sleep'         => 1,
+            'retry_when'          => [503],
+        ], $overrides);
 
         return new RForceClient(
-            http:       app(HttpFactory::class),
-            auth:       $auth,
-            baseUrl:    'https://gw.example/rforce',
-            httpConfig: [
-                'timeout'        => 5,
-                'retry_attempts' => $retryAttempts,
-                'retry_sleep'    => 1,
-                'retry_when'     => [503],
-            ],
+            http:    app(HttpFactory::class),
+            baseUrl: self::URL,
+            config:  $config,
         );
     }
 
-    public function test_execute_soql_posts_query_with_bearer_token(): void
+    public function test_query_sends_soql_as_q_parameter_with_mulesoft_headers(): void
     {
         Http::fake([
-            'https://gw.example/rforce/query' => Http::response([
-                'records'       => [['Id' => 'A1'], ['Id' => 'A2']],
-                'nextPageToken' => 'page-2',
-                'totalSize'     => 100,
+            self::URL.'*' => Http::response([
+                'totalSize'      => 2,
+                'done'           => true,
+                'records'        => [
+                    ['Id' => 'A1', 'Name' => 'Acme'],
+                    ['Id' => 'A2', 'Name' => 'Globex'],
+                ],
             ], 200),
         ]);
 
-        $result = $this->client()->executeSoql('SELECT Id FROM Account', null, 250);
+        $result = $this->client()->query('SELECT Name FROM Account LIMIT 10');
 
+        $this->assertSame(2, $result->totalSize);
+        $this->assertTrue($result->done);
+        $this->assertNull($result->nextRecordsUrl);
         $this->assertSame(['A1', 'A2'], array_column($result->records, 'Id'));
-        $this->assertSame('page-2', $result->nextCursor);
-        $this->assertSame(100, $result->totalSize);
 
         Http::assertSent(function (Request $request): bool {
-            $body = json_decode($request->body(), true);
-            return $request->url() === 'https://gw.example/rforce/query'
-                && $request->method() === 'POST'
-                && ($request->header('Authorization')[0] ?? '') === 'Bearer test-token'
-                && ($body['q'] ?? null) === 'SELECT Id FROM Account'
-                && ($body['pageSize'] ?? null) === 250;
+            return $request->method() === 'GET'
+                && str_starts_with($request->url(), self::URL)
+                && $request->data() === ['q' => 'SELECT Name FROM Account LIMIT 10']
+                && $request->header('proxy_client_id')[0] === 'PROXY_ID'
+                && $request->header('proxy_client_secret')[0] === 'PROXY_SECRET'
+                && $request->header('sf_client_id')[0] === 'SF_ID'
+                && $request->header('sf_client_secret')[0] === 'SF_SECRET'
+                && $request->header('sf_version')[0] === 'v60.0';
         });
     }
 
-    public function test_execute_soql_accepts_salesforce_style_next_records_url(): void
+    public function test_sf_environment_url_header_is_omitted_when_blank(): void
     {
         Http::fake([
-            'https://gw.example/rforce/query' => Http::response([
-                'records'        => [['Id' => 'A1']],
-                'nextRecordsUrl' => '/services/data/v60.0/query/01g4000000ABCDe-2000',
+            self::URL.'*' => Http::response(['totalSize' => 0, 'done' => true, 'records' => []], 200),
+        ]);
+
+        $this->client()->query('SELECT Name FROM Account LIMIT 1');
+
+        Http::assertSent(static fn (Request $r): bool =>
+            $r->header('sf_environment_url') === [],
+        );
+    }
+
+    public function test_sf_environment_url_header_is_sent_when_configured(): void
+    {
+        Http::fake([
+            self::URL.'*' => Http::response(['totalSize' => 0, 'done' => true, 'records' => []], 200),
+        ]);
+
+        $this->client(['sf_environment_url' => 'https://my-sf.example'])
+            ->query('SELECT Name FROM Account LIMIT 1');
+
+        Http::assertSent(static fn (Request $r): bool =>
+            ($r->header('sf_environment_url')[0] ?? null) === 'https://my-sf.example',
+        );
+    }
+
+    public function test_query_more_sends_next_records_url_header_without_q_parameter(): void
+    {
+        Http::fake([
+            self::URL.'*' => Http::response([
                 'totalSize'      => 5000,
+                'done'           => true,
+                'records'        => [['Id' => 'A100']],
             ], 200),
         ]);
 
-        $result = $this->client()->executeSoql('SELECT Id FROM Account');
+        $this->client()->queryMore('/services/data/v60.0/query/01g4000000ABCDe-2000');
 
-        $this->assertSame('/services/data/v60.0/query/01g4000000ABCDe-2000', $result->nextCursor);
+        Http::assertSent(static function (Request $r): bool {
+            return $r->method() === 'GET'
+                && ($r->header('nextRecordsUrl')[0] ?? null) === '/services/data/v60.0/query/01g4000000ABCDe-2000'
+                && $r->data() === [];
+        });
     }
 
-    public function test_execute_soql_refreshes_token_on_401_and_retries(): void
+    public function test_query_returns_pagination_state_when_more_pages_exist(): void
     {
-        Http::fakeSequence('https://gw.example/rforce/query')
-            ->push(['error' => 'unauthorized'], 401)
-            ->push(['records' => [], 'nextPageToken' => null], 200);
+        Http::fake([
+            self::URL.'*' => Http::response([
+                'totalSize'      => 10000,
+                'done'           => false,
+                'nextRecordsUrl' => '/services/data/v60.0/query/01g...-2000',
+                'records'        => [['Id' => 'A1']],
+            ], 200),
+        ]);
 
-        $auth = Mockery::mock(RForceAuthenticator::class);
-        $auth->shouldReceive('token')->twice()->andReturn('stale', 'fresh');
+        $result = $this->client()->query('SELECT Name FROM Account');
 
-        $client = new RForceClient(
-            http:    app(HttpFactory::class),
-            auth:    $auth,
-            baseUrl: 'https://gw.example/rforce',
-            httpConfig: ['timeout' => 5, 'retry_attempts' => 1, 'retry_sleep' => 1, 'retry_when' => []],
-        );
-
-        $result = $client->executeSoql('SELECT Id FROM Account');
-        $this->assertSame([], $result->records);
+        $this->assertFalse($result->done);
+        $this->assertSame('/services/data/v60.0/query/01g...-2000', $result->nextRecordsUrl);
+        $this->assertTrue($result->hasMore());
     }
 
-    public function test_execute_soql_retries_on_transient_5xx(): void
+    public function test_non_2xx_response_throws_rforce_exception(): void
     {
-        Http::fakeSequence('https://gw.example/rforce/query')
+        Http::fake([
+            self::URL.'*' => Http::response(['error' => 'invalid SOQL'], 400),
+        ]);
+
+        $this->expectException(RForceException::class);
+        $this->expectExceptionMessageMatches('/HTTP 400/');
+        $this->client()->query('SELECT FROM Account');
+    }
+
+    public function test_non_json_response_throws_rforce_exception(): void
+    {
+        Http::fake([
+            self::URL.'*' => Http::response('<html>503</html>', 200, ['Content-Type' => 'text/html']),
+        ]);
+
+        $this->expectException(RForceException::class);
+        $this->expectExceptionMessageMatches('/non-JSON/');
+        $this->client()->query('SELECT Name FROM Account LIMIT 1');
+    }
+
+    public function test_retries_on_transient_5xx(): void
+    {
+        Http::fakeSequence(self::URL.'*')
             ->push(['error' => 'busy'], 503)
-            ->push(['records' => [['Id' => 'A1']], 'nextPageToken' => null], 200);
+            ->push(['totalSize' => 1, 'done' => true, 'records' => [['Id' => 'A1']]], 200);
 
-        $result = $this->client()->executeSoql('SELECT Id FROM Account');
+        $result = $this->client(['retry_attempts' => 2])->query('SELECT Name FROM Account');
+
         $this->assertSame([['Id' => 'A1']], $result->records);
     }
 
-    public function test_execute_soql_throws_on_persistent_failure(): void
+    public function test_sf_version_defaults_to_v60_when_not_provided(): void
     {
         Http::fake([
-            'https://gw.example/rforce/query' => Http::response(['error' => 'kaboom'], 500),
+            self::URL.'*' => Http::response(['totalSize' => 0, 'done' => true, 'records' => []], 200),
         ]);
 
-        $this->expectException(\App\Services\RForce\Exceptions\RForceException::class);
-        $this->client()->executeSoql('SELECT Id FROM Account');
+        // Wipe sf_version; the client should still send the default.
+        $client = $this->client(['sf_version' => null]);
+        $client->query('SELECT Name FROM Account');
+
+        Http::assertSent(static fn (Request $r): bool => $r->header('sf_version')[0] === 'v60.0');
     }
 }

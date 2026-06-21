@@ -16,24 +16,21 @@ class RawRforceRecord extends Model
         'external_source_id',
         'last_sync_run_id',
         'query_definition_id',
-        'object_type',
+        'source_object_type',
+        'source_url',
         'external_id',
         'payload',
         'payload_hash',
-        'external_modified_at',
-        'fetched_at',
         'first_seen_at',
         'last_seen_at',
         'last_synced_at',
     ];
 
     protected $casts = [
-        'payload'              => 'array',
-        'external_modified_at' => 'datetime',
-        'fetched_at'           => 'datetime',
-        'first_seen_at'        => 'datetime',
-        'last_seen_at'         => 'datetime',
-        'last_synced_at'       => 'datetime',
+        'payload'        => 'array',
+        'first_seen_at'  => 'datetime',
+        'last_seen_at'   => 'datetime',
+        'last_synced_at' => 'datetime',
     ];
 
     public function externalSource(): BelongsTo

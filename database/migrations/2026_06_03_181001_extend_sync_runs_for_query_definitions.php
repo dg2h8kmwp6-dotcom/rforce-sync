@@ -7,12 +7,10 @@ use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Support\Facades\Schema;
 
 /**
- * Bring sync_runs in line with a query-driven world:
- *   - link to the QueryDefinition that triggered the run
- *   - track received / inserted / changed / skipped / failed separately
- *   - precompute duration so dashboards don't have to subtract timestamps
- *   - store the SOQL that was actually executed (so a later edit to the
- *     definition doesn't make historical runs unintelligible)
+ * Link sync_runs back to the QueryDefinition that triggered them and capture
+ * the exact SOQL that ran (so a later edit to the definition doesn't make
+ * historical runs unintelligible). Also precomputes duration so dashboards
+ * don't have to subtract timestamps.
  */
 return new class extends Migration
 {
@@ -25,13 +23,7 @@ return new class extends Migration
                 ->constrained('query_definitions')
                 ->nullOnDelete();
 
-            // The SOQL that ran. Captured at start so edits don't rewrite history.
-            $table->text('soql')->nullable()->after('object_type');
-
-            $table->unsignedInteger('records_received')->default(0)->after('records_fetched');
-            $table->unsignedInteger('records_inserted')->default(0)->after('records_received');
-            $table->unsignedInteger('records_changed')->default(0)->after('records_inserted');
-            $table->unsignedInteger('records_skipped')->default(0)->after('records_changed');
+            $table->text('soql')->nullable()->after('target_dataset');
 
             $table->unsignedBigInteger('duration_ms')->nullable()->after('finished_at');
 
@@ -47,10 +39,6 @@ return new class extends Migration
             $table->dropColumn([
                 'query_definition_id',
                 'soql',
-                'records_received',
-                'records_inserted',
-                'records_changed',
-                'records_skipped',
                 'duration_ms',
             ]);
         });

@@ -20,7 +20,7 @@ class AccountTransformerTest extends TestCase
     {
         $manager = new SyncRunManager();
         $source  = $manager->defaultSource();
-        $run     = $manager->start($source, 'Account');
+        $run     = $manager->start($source, 'accounts');
 
         $payload = [
             'Id'                => 'A1',
@@ -38,14 +38,14 @@ class AccountTransformerTest extends TestCase
         ];
 
         $raw = RawRforceRecord::query()->create([
-            'external_source_id'   => $source->id,
-            'last_sync_run_id'     => $run->id,
-            'object_type'          => 'Account',
-            'external_id'          => 'A1',
-            'payload'              => $payload,
-            'payload_hash'         => hash('sha256', json_encode($payload)),
-            'external_modified_at' => Carbon::parse('2026-05-01T12:00:00Z'),
-            'fetched_at'           => Carbon::now(),
+            'external_source_id' => $source->id,
+            'last_sync_run_id'   => $run->id,
+            'source_object_type' => 'Account',
+            'external_id'        => 'A1',
+            'payload'            => $payload,
+            'payload_hash'       => hash('sha256', json_encode($payload)),
+            'first_seen_at'      => Carbon::now(),
+            'last_seen_at'       => Carbon::now(),
         ]);
 
         (new AccountTransformer())->transform($raw, $run);
@@ -71,17 +71,18 @@ class AccountTransformerTest extends TestCase
     {
         $manager = new SyncRunManager();
         $source  = $manager->defaultSource();
-        $run     = $manager->start($source, 'Account');
+        $run     = $manager->start($source, 'accounts');
 
         $payload = ['Id' => 'A1', 'Name' => 'Acme'];
         $raw = RawRforceRecord::query()->create([
             'external_source_id' => $source->id,
             'last_sync_run_id'   => $run->id,
-            'object_type'        => 'Account',
+            'source_object_type' => 'Account',
             'external_id'        => 'A1',
             'payload'            => $payload,
             'payload_hash'       => hash('sha256', json_encode($payload)),
-            'fetched_at'         => Carbon::now(),
+            'first_seen_at'      => Carbon::now(),
+            'last_seen_at'       => Carbon::now(),
         ]);
 
         $t = new AccountTransformer();

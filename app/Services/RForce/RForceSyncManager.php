@@ -20,11 +20,11 @@ use Throwable;
  *
  * What it does, in order:
  *   1. Open a SyncRun (status = running) tagged with the query + SOQL.
- *   2. Stream pages from the executor.
+ *   2. Stream pages from the executor (one query() + N queryMore() calls).
  *   3. For each page, compare payload hashes against the existing raw rows
  *      to bucket records into new/changed/unchanged.
- *   4. Upsert raw rows, bumping last_seen_at on every hit and last_synced_at
- *      on changes; first_seen_at only sets on insert.
+ *   4. Upsert raw rows, bumping last_seen_at on every hit and first_seen_at
+ *      only on insert.
  *   5. Update SyncRun counters (received/inserted/changed/skipped).
  *   6. Hand off to the transformer (downstream concern: TransformRForceRecordsJob).
  *   7. Finish the SyncRun (status derived from counters).
@@ -38,32 +38,11 @@ class RForceSyncManager
         private readonly SyncRunManager $runs,
     ) {}
 
-    public function start(
-        ExternalSource $source,
-        ?QueryDefinition $definition,
-        string $soql,
-        ?string $objectType = null,
-        ?DateTimeInterface $since = null,
-        ?int $limit = null,
-        array $meta = [],
-    ): SyncRun {
-        return $this->runs->start(
-            source:        $source,
-            objectType:    $objectType,
-            since:         $since,
-            limit:         $limit,
-            meta:          $meta,
-            queryDefinition: $definition,
-            soql:          $soql,
-        );
-    }
-
     /**
      * Run a full sync for the given QueryDefinition.
      *
      * If $dryRun is true, the connector is invoked but raw rows are NOT
      * written and the run is finished with status=succeeded and a meta flag.
-     * Caller still gets accurate received/changed/inserted/skipped counts.
      */
     public function sync(
         QueryDefinition $definition,
@@ -75,20 +54,18 @@ class RForceSyncManager
         $source = $definition->externalSource ?? $this->runs->defaultSource();
         $soql   = RForceQueryExecutor::buildSoql($definition, $since, $limit);
 
-        $run = $this->start(
-            source:     $source,
-            definition: $definition,
-            soql:       $soql,
-            objectType: $definition->target_object,
-            since:      $since,
-            limit:      $limit,
-            meta:       array_merge($meta, ['dry_run' => $dryRun]),
+        $run = $this->runs->start(
+            source:          $source,
+            targetDataset:   $definition->target_dataset,
+            since:           $since,
+            limit:           $limit,
+            meta:            array_merge($meta, ['dry_run' => $dryRun]),
+            queryDefinition: $definition,
+            soql:            $soql,
         );
 
         try {
-            $pageSize = (int) config('rforce.sync.page_size', 500);
-
-            foreach ($this->executor->streamPages($soql, $pageSize) as $page) {
+            foreach ($this->executor->executePaginated($soql) as $page) {
                 $records = $page->records;
                 $this->runs->incrementReceived($run, count($records));
 
@@ -100,7 +77,6 @@ class RForceSyncManager
                     source:     $source,
                     definition: $definition,
                     run:        $run,
-                    objectType: $definition->target_object ?? 'Unknown',
                     records:    $records,
                 );
 
@@ -108,16 +84,17 @@ class RForceSyncManager
                 $this->runs->incrementChanged($run, $diff['changed']);
                 $this->runs->incrementSkipped($run, $diff['unchanged']);
                 if ($diff['malformed'] > 0) {
-                    $this->runs->incrementFailed($run, $diff['malformed']);
+                    $this->runs->recordError(
+                        $run,
+                        "Skipped {$diff['malformed']} record(s) with no usable Id",
+                        'malformed',
+                        ['count' => $diff['malformed']],
+                    );
                 }
             }
 
             $definition->forceFill(['last_run_at' => Carbon::now()])->save();
 
-            // Transform handoff is the job's responsibility; SyncManager
-            // returns the run after raw writes so the job can dispatch the
-            // transformer. If the caller wants synchronous transformation,
-            // they should call $transformer->transformBatch separately.
             return $run;
         } catch (Throwable $e) {
             $this->runs->recordError($run, $e->getMessage(), 'gateway', ['exception' => $e::class]);
@@ -140,7 +117,6 @@ class RForceSyncManager
         ExternalSource $source,
         ?QueryDefinition $definition,
         SyncRun $run,
-        string $objectType,
         array $records,
     ): array {
         $diff = ['inserted' => 0, 'changed' => 0, 'unchanged' => 0, 'malformed' => 0];
@@ -159,10 +135,11 @@ class RForceSyncManager
 
             $payloadJson = json_encode($record, JSON_THROW_ON_ERROR);
             $prepared[$externalId] = [
-                'record'  => $record,
-                'json'    => $payloadJson,
-                'hash'    => hash('sha256', $payloadJson),
-                'modified' => self::extractModified($record),
+                'object_type' => self::extractObjectType($record),
+                'source_url'  => self::extractSourceUrl($record),
+                'external_id' => $externalId,
+                'json'        => $payloadJson,
+                'hash'        => hash('sha256', $payloadJson),
             ];
         }
 
@@ -173,12 +150,11 @@ class RForceSyncManager
         // Look up existing hashes in one query.
         $existing = RawRforceRecord::query()
             ->where('external_source_id', $source->id)
-            ->where('object_type', $objectType)
             ->whereIn('external_id', array_keys($prepared))
             ->get(['external_id', 'payload_hash', 'first_seen_at'])
             ->keyBy('external_id');
 
-        $now = Carbon::now();
+        $now  = Carbon::now();
         $rows = [];
 
         foreach ($prepared as $externalId => $p) {
@@ -187,76 +163,45 @@ class RForceSyncManager
 
             if ($existingRow === null) {
                 $diff['inserted']++;
-                $rows[] = [
-                    'external_source_id'   => $source->id,
-                    'last_sync_run_id'     => $run->id,
-                    'query_definition_id'  => $definition?->id,
-                    'object_type'          => $objectType,
-                    'external_id'          => $externalId,
-                    'payload'              => $p['json'],
-                    'payload_hash'         => $p['hash'],
-                    'external_modified_at' => $p['modified'],
-                    'fetched_at'           => $now,
-                    'first_seen_at'        => $now,
-                    'last_seen_at'         => $now,
-                    'last_synced_at'       => null,
-                    'created_at'           => $now,
-                    'updated_at'           => $now,
-                ];
+                $rows[] = $this->buildRow($source, $run, $definition, $p, firstSeen: $now, lastSeen: $now);
                 continue;
             }
 
             if ($existingRow->payload_hash === $p['hash']) {
                 $diff['unchanged']++;
-                $rows[] = [
-                    'external_source_id'   => $source->id,
-                    'last_sync_run_id'     => $run->id,
-                    'query_definition_id'  => $definition?->id,
-                    'object_type'          => $objectType,
-                    'external_id'          => $externalId,
-                    'payload'              => $p['json'],
-                    'payload_hash'         => $p['hash'],
-                    'external_modified_at' => $p['modified'],
-                    'fetched_at'           => $now,
-                    'first_seen_at'        => $existingRow->first_seen_at ?? $now,
-                    'last_seen_at'         => $now,
-                    'last_synced_at'       => null,
-                    'created_at'           => $now,
-                    'updated_at'           => $now,
-                ];
+                $rows[] = $this->buildRow(
+                    $source,
+                    $run,
+                    $definition,
+                    $p,
+                    firstSeen: $existingRow->first_seen_at ?? $now,
+                    lastSeen:  $now,
+                );
                 continue;
             }
 
             $diff['changed']++;
-            $rows[] = [
-                'external_source_id'   => $source->id,
-                'last_sync_run_id'     => $run->id,
-                'query_definition_id'  => $definition?->id,
-                'object_type'          => $objectType,
-                'external_id'          => $externalId,
-                'payload'              => $p['json'],
-                'payload_hash'         => $p['hash'],
-                'external_modified_at' => $p['modified'],
-                'fetched_at'           => $now,
-                'first_seen_at'        => $existingRow->first_seen_at ?? $now,
-                'last_seen_at'         => $now,
-                'last_synced_at'       => null,
-                'created_at'           => $now,
-                'updated_at'           => $now,
-            ];
+            $rows[] = $this->buildRow(
+                $source,
+                $run,
+                $definition,
+                $p,
+                firstSeen: $existingRow->first_seen_at ?? $now,
+                lastSeen:  $now,
+            );
         }
 
         if ($rows !== []) {
             RawRforceRecord::query()->upsert(
                 values: $rows,
-                uniqueBy: ['external_source_id', 'object_type', 'external_id'],
+                uniqueBy: ['external_source_id', 'external_id'],
                 update: [
                     'last_sync_run_id',
                     'query_definition_id',
+                    'source_object_type',
+                    'source_url',
                     'payload',
                     'payload_hash',
-                    'external_modified_at',
-                    'fetched_at',
                     'last_seen_at',
                     'updated_at',
                 ],
@@ -264,6 +209,35 @@ class RForceSyncManager
         }
 
         return $diff;
+    }
+
+    /**
+     * @param  array<string,mixed>  $p
+     * @return array<string,mixed>
+     */
+    private function buildRow(
+        ExternalSource $source,
+        SyncRun $run,
+        ?QueryDefinition $definition,
+        array $p,
+        Carbon $firstSeen,
+        Carbon $lastSeen,
+    ): array {
+        return [
+            'external_source_id'  => $source->id,
+            'last_sync_run_id'    => $run->id,
+            'query_definition_id' => $definition?->id,
+            'source_object_type'  => $p['object_type'],
+            'source_url'          => $p['source_url'],
+            'external_id'         => $p['external_id'],
+            'payload'             => $p['json'],
+            'payload_hash'        => $p['hash'],
+            'first_seen_at'       => $firstSeen,
+            'last_seen_at'        => $lastSeen,
+            'last_synced_at'      => null,
+            'created_at'          => $lastSeen,
+            'updated_at'          => $lastSeen,
+        ];
     }
 
     /**
@@ -280,18 +254,29 @@ class RForceSyncManager
     }
 
     /**
+     * record.attributes.type per Salesforce REST shape.
+     *
      * @param  array<string,mixed>  $record
      */
-    public static function extractModified(array $record): ?Carbon
+    public static function extractObjectType(array $record): ?string
     {
-        foreach (['LastModifiedDate', 'lastModifiedDate', 'updated_at', 'modifiedAt'] as $key) {
-            if (! empty($record[$key])) {
-                try {
-                    return Carbon::parse((string) $record[$key]);
-                } catch (\Throwable) {
-                    return null;
-                }
-            }
+        $attrs = $record['attributes'] ?? null;
+        if (is_array($attrs) && isset($attrs['type']) && is_string($attrs['type']) && $attrs['type'] !== '') {
+            return $attrs['type'];
+        }
+        return null;
+    }
+
+    /**
+     * record.attributes.url per Salesforce REST shape.
+     *
+     * @param  array<string,mixed>  $record
+     */
+    public static function extractSourceUrl(array $record): ?string
+    {
+        $attrs = $record['attributes'] ?? null;
+        if (is_array($attrs) && isset($attrs['url']) && is_string($attrs['url']) && $attrs['url'] !== '') {
+            return $attrs['url'];
         }
         return null;
     }

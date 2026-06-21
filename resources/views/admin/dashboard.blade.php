@@ -84,7 +84,7 @@
                     <tr>
                         <td class="px-4 py-2 font-mono text-slate-500">#{{ $run->id }}</td>
                         <td class="px-4 py-2">{{ $run->queryDefinition?->name ?? '—' }}</td>
-                        <td class="px-4 py-2">{{ $run->object_type ?? '—' }}</td>
+                        <td class="px-4 py-2">{{ $run->target_dataset ?? '—' }}</td>
                         <td class="px-4 py-2">
                             <span class="px-2 py-0.5 rounded text-xs {{ $statusColor[$run->status?->value] ?? 'bg-slate-100 text-slate-700' }}">
                                 {{ $run->status?->value }}
@@ -135,7 +135,7 @@
                             <div class="text-xs text-slate-500">{{ $q->description }}</div>
                             <code class="text-xs text-slate-500 block mt-1">{{ \Illuminate\Support\Str::limit($q->soql, 120) }}</code>
                         </td>
-                        <td class="px-4 py-2">{{ $q->target_object ?? '—' }}</td>
+                        <td class="px-4 py-2">{{ $q->target_dataset ?? '—' }}</td>
                         <td class="px-4 py-2 font-mono text-xs">{{ $q->schedule ?? 'manual' }}</td>
                         <td class="px-4 py-2 text-slate-500">{{ optional($q->last_run_at)->diffForHumans() ?? 'never' }}</td>
                         <td class="px-4 py-2">

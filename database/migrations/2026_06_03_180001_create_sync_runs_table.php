@@ -16,11 +16,11 @@ return new class extends Migration
                 ->constrained('external_sources')
                 ->cascadeOnDelete();
 
-            // Which logical object this run targeted (Account, Contact, ...).
-            // Nullable so we can also model an "all objects" sync-all run.
-            $table->string('object_type')->nullable();
+            // Business-named dataset this run targeted (accounts/contacts/...).
+            // Mirrors QueryDefinition.target_dataset. Nullable for ad-hoc SOQL.
+            $table->string('target_dataset')->nullable();
 
-            // pending | running | succeeded | partial | failed
+            // pending | running | succeeded | partial | failed | cancelled
             // Mirrors App\Enums\SyncStatus.
             $table->string('status')->default('pending');
 
@@ -29,8 +29,10 @@ return new class extends Migration
             $table->unsignedInteger('limit')->nullable();
 
             // Run accounting.
-            $table->unsignedInteger('records_fetched')->default(0);
-            $table->unsignedInteger('records_upserted')->default(0);
+            $table->unsignedInteger('records_received')->default(0);
+            $table->unsignedInteger('records_inserted')->default(0);
+            $table->unsignedInteger('records_changed')->default(0);
+            $table->unsignedInteger('records_skipped')->default(0);
             $table->unsignedInteger('records_failed')->default(0);
 
             $table->timestamp('started_at')->nullable();
@@ -44,7 +46,7 @@ return new class extends Migration
 
             $table->timestamps();
 
-            $table->index(['object_type', 'status']);
+            $table->index(['target_dataset', 'status']);
             $table->index(['external_source_id', 'started_at']);
         });
     }

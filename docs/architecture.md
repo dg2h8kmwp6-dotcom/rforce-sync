@@ -4,28 +4,99 @@
 
 This Laravel application is an internal data platform that:
 
-1. Authenticates against a gateway in front of rForce/Salesforce.
-2. Executes **saved SOQL queries** (`QueryDefinition` rows).
-3. Lands raw responses in `raw_rforce_records` for auditability and replay.
-4. Normalizes raw rows into relational tables (`normalized_accounts`,
-   `normalized_contacts`, `normalized_opportunities`, and easily more).
-5. Exposes the normalized data through an internal REST API at
+1. Sends **saved SOQL queries** (`QueryDefinition` rows) to the Renewal by
+   Andersen **MuleSoft Data Gateway**, which authenticates against Salesforce
+   on the app's behalf.
+2. Lands raw responses in `raw_rforce_records` for auditability and replay.
+3. Optionally normalizes raw rows into dataset-specific tables via
+   per-`QueryDefinition` transformer classes.
+4. Exposes the normalized data through an internal REST API at
    `/api/internal/*`.
-6. Supports optional Google Sheets exports through a vendor-neutral
+5. Supports optional Google Sheets exports through a vendor-neutral
    `DatasetExporterInterface`.
-7. Treats MySQL as the system of record.
-8. Is deployable on Laravel Cloud.
+6. Treats MySQL as the system of record.
+7. Is deployable on Laravel Cloud.
 
 The codebase is organized around **two principles**:
 
-- **SOQL is first-class.** The connector exposes `executeSoql()`. Sync runs
-  are tagged with the QueryDefinition that produced them and the actual SOQL
-  string executed at that moment.
+- **SOQL is first-class.** The connector exposes `query()` and `queryMore()`.
+  Sync runs are tagged with the QueryDefinition that produced them and the
+  actual SOQL string executed at that moment.
 - **Query-driven, not object-driven.** Adding a new Salesforce object, custom
   field, or `*__c` custom object means inserting a row into
   `query_definitions` — no code change required for the ingest pipeline. A
   transformer is only needed if the records should also land in a normalized
   table.
+
+## The MuleSoft Data Gateway
+
+The app does NOT authenticate to Salesforce directly. Every request hits a
+single Mule endpoint:
+
+```
+GET  {RFORCE_BASE_URL}?q=<SOQL>
+```
+
+Three environments are supported via `RFORCE_ENVIRONMENT`:
+
+| env   | URL |
+|-------|-----|
+| test  | https://it1apitst2.andersencorp.com/api/rforce/control-layer/query |
+| stage | https://it1apistg2.andersencorp.com/api/rforce/control-layer/query |
+| prod  | https://it1api2.andersencorp.com/api/rforce/control-layer/query    |
+
+Local/dev defaults to **stage**.
+
+### Required headers
+
+Every request to the gateway carries:
+
+| header                 | source                       |
+|------------------------|------------------------------|
+| `proxy_client_id`      | `RFORCE_PROXY_CLIENT_ID`     |
+| `proxy_client_secret`  | `RFORCE_PROXY_CLIENT_SECRET` |
+| `sf_client_id`         | `RFORCE_SF_CLIENT_ID`        |
+| `sf_client_secret`     | `RFORCE_SF_CLIENT_SECRET`    |
+| `sf_version`           | `RFORCE_SF_VERSION` (default `v60.0`; `v58.0` also valid) |
+| `sf_environment_url`   | `RFORCE_SF_ENVIRONMENT_URL` (optional — omitted when blank) |
+
+MuleSoft uses the `proxy_*` credentials to authenticate the caller, then
+uses the `sf_*` credentials to obtain a Salesforce session and forward the
+SOQL. The Laravel app NEVER calls `/services/oauth2/token` — there is no
+direct Salesforce auth handshake on this side of the wire.
+
+### Response shape
+
+Salesforce REST style, returned verbatim by MuleSoft:
+
+```json
+{
+  "totalSize": 10000,
+  "done": false,
+  "nextRecordsUrl": "/services/data/v60.0/query/01g4000000ABCDe-2000",
+  "records": [
+    {
+      "attributes": { "type": "Account", "url": "/services/data/v60.0/sobjects/Account/001.../" },
+      "Id": "001ABCdef",
+      "Name": "Acme"
+    }
+  ]
+}
+```
+
+### Pagination — `nextRecordsUrl` header
+
+When `done` is `false`, the next page is fetched by hitting the same gateway
+URL again, this time with the `nextRecordsUrl` from the previous response
+sent **as a header** (no `q` parameter):
+
+```http
+GET {RFORCE_BASE_URL}
+nextRecordsUrl: /services/data/v60.0/query/01g4000000ABCDe-2000
+```
+
+This behavior is encapsulated in `RForceClient::queryMore()` so it can be
+adjusted in one place if the gateway contract evolves.
 
 ## Component Map
 
@@ -33,9 +104,9 @@ The codebase is organized around **two principles**:
 ┌───────────────────────────┐    ┌──────────────────────────────┐
 │ Console / Schedule        │    │ HTTP                         │
 │ - rforce:test-connection  │    │ - /api/internal/customers    │
-│ - rforce:query            │    │ - /api/internal/sales        │
-│ - rforce:sync             │    │ - /api/internal/contacts     │
-│ - sheets:export           │    │ - /api/internal/sync-runs    │
+│ - rforce:query "..."      │    │ - /api/internal/sales        │
+│ - rforce:run-query <q>    │    │ - /api/internal/contacts     │
+│ - rforce:sync             │    │ - /api/internal/sync-runs    │
 │ - QueryDefinition cron    │    │ - /api/internal/query-defs   │
 └────────────┬──────────────┘    │ - /admin (Tailwind dashboard)│
              │                   └──────────────┬───────────────┘
@@ -48,11 +119,12 @@ The codebase is organized around **two principles**:
 │         ExportDatasetToGoogleSheetsJob                         │
 │                                                                │
 │  Services:                                                     │
-│    RForce\RForceClient (HTTP transport, retries, 401 refresh)  │
-│    RForce\RForceAuthenticator (token cache, 3 strategies)      │
-│    RForce\RForceQueryExecutor (SOQL pagination + helpers)      │
+│    RForce\RForceClient (HTTP transport: MuleSoft headers,      │
+│                         retries, query / queryMore)            │
+│    RForce\RForceQueryExecutor (execute / executePaginated,     │
+│                                placeholders, SOQL helpers)     │
 │    RForce\RForceSyncManager (orchestration + change detection) │
-│    RForce\Transformers\* (Account/Contact/Opportunity → normalized)
+│    RForce\Transformers\* (dataset → normalized rows; optional) │
 │    Sync\SyncRunManager (run lifecycle + counters)              │
 │    Sheets\GoogleSheetsExporter implements                      │
 │      Sheets\Contracts\SheetsExporter extends                   │
@@ -67,9 +139,7 @@ The codebase is organized around **two principles**:
 │  query_definitions                                             │
 │  sync_runs   ─────── sync_errors                               │
 │  raw_rforce_records                                            │
-│  normalized_accounts                                           │
-│  normalized_contacts                                           │
-│  normalized_opportunities                                      │
+│  normalized_accounts / contacts / opportunities (optional)     │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -88,16 +158,20 @@ RForceSyncManager.sync(definition, since, limit, dryRun)
         │
         ├── SyncRunManager.start()         (status = running, captures SOQL)
         │
-        ├── for each page from
-        │     RForceQueryExecutor.streamPages(soql):
-        │       ├── increment records_received
-        │       ├── upsertWithChangeDetection():
-        │       │     · hash payloads
-        │       │     · batch-fetch existing hashes by (source, object, external_id)
-        │       │     · bucket: new / changed / unchanged / malformed
-        │       │     · upsert raw_rforce_records, bumping first_seen_at on
-        │       │       insert and last_seen_at always
-        │       └── increment inserted/changed/skipped counters
+        ├── RForceQueryExecutor.executePaginated(soql):
+        │     ├── connector.query(soql)             (first page)
+        │     └── connector.queryMore(nextRecordsUrl)  ×N
+        │
+        ├── for each page:
+        │     ├── increment records_received
+        │     ├── upsertWithChangeDetection():
+        │     │     · extract Id, attributes.type, attributes.url
+        │     │     · hash payloads
+        │     │     · batch-fetch existing hashes by (source, external_id)
+        │     │     · bucket: new / changed / unchanged / malformed
+        │     │     · upsert raw_rforce_records, bumping first_seen_at on
+        │     │       insert and last_seen_at always
+        │     └── increment inserted/changed/skipped counters
         │
         ├── stamp QueryDefinition.last_run_at
         │
@@ -107,9 +181,15 @@ TransformRForceRecordsJob.dispatch(syncRunId)
         ▼
 TransformRForceRecordsJob.handle(runs)
         │
-        ├── resolve transformer (QueryDefinition.transformer_class ?? config/rforce.objects[*].transformer)
+        ├── resolve transformer
+        │     (QueryDefinition.transformer_class ??
+        │      config/rforce.datasets[target_dataset].transformer)
         │
-        ├── chunk raw rows where last_sync_run_id = run.id
+        ├── if no transformer is registered:
+        │     · stamp raw_rforce_records.last_synced_at = now
+        │     · finish the run cleanly (raw rows are the only required output)
+        │
+        ├── otherwise chunk raw rows where last_sync_run_id = run.id
         │     for each chunk:
         │       · transformer.transformBatch(chunk, run, source)
         │       · update raw_rforce_records.last_synced_at = now()
@@ -124,8 +204,8 @@ failed) unless the chunk pipeline itself blows up.
 
 **Idempotency.** Re-running a definition is safe at every layer:
 
-- `raw_rforce_records` is keyed `(source, object_type, external_id)` and uses
-  `upsert()`.
+- `raw_rforce_records` is keyed `(external_source_id, external_id)` and uses
+  `upsert()`. Salesforce Ids are globally unique within a source.
 - Hash comparison means an unchanged payload is a `last_seen_at` touch only.
 - Normalized rows use `updateOrCreate` keyed on `(source, external_id)`.
 
@@ -137,33 +217,50 @@ failed) unless the chunk pipeline itself blows up.
         ▼
 query_definitions
   id, name, description, soql,
-  target_object, transformer_class?,
+  target_dataset, transformer_class?,
   enabled, schedule, last_run_at
         │
         ├── routes/console.php registers Schedule::job() for any enabled
         │   definition with a `schedule` cron expression.
         │
-        ├── rforce:query <id|name>           → ad-hoc dry-run stream to stdout
-        ├── rforce:query <id|name> --persist → equivalent to rforce:sync
-        ├── rforce:sync <id|name>            → dispatch RunQueryDefinitionJob
-        └── rforce:sync                      → dispatch all enabled defs
+        ├── rforce:query "<SOQL>"                 → ad-hoc dry-run stream to stdout
+        ├── rforce:run-query <id|name>            → dispatch RunQueryDefinitionJob (single)
+        ├── rforce:run-query <id|name> --inline   → run in-process
+        ├── rforce:sync                           → dispatch all enabled defs
+        └── rforce:test-connection                → SELECT Name FROM Account LIMIT 1
 ```
 
 Saved queries are mutable — editing a definition does not retroactively
 change history. Each `sync_runs` row captures the exact SOQL that ran.
 
+### SOQL placeholders
+
+`QueryDefinition.soql` may contain a fixed set of `{{...}}` placeholders that
+are resolved at execution time to SOQL-typed literals:
+
+| token              | resolution |
+|--------------------|------------|
+| `{{last_sync_at}}` | `--since` arg → QueryDefinition.last_run_at → epoch fallback, all formatted as ISO-8601 |
+| `{{now}}`          | Carbon::now() at execution time, ISO-8601 |
+
+Unknown placeholders are left untouched so the gateway fails loudly rather
+than silently stripping content. **Free-form user input is never spliced
+into SOQL** — only typed values produced by the placeholder resolver.
+
 ## Data Flow Diagram
 
 ```
-   Gateway (rForce / Salesforce REST + SOQL)
+   MuleSoft Data Gateway (fronts rForce / Salesforce)
                   │
-                  │  POST /query  { "q": "SELECT ...", "cursor": "..." }
-                  │  ← { records, nextPageToken | nextRecordsUrl, totalSize }
+                  │  GET {base_url}?q=<SOQL>          (first page)
+                  │  GET {base_url} + nextRecordsUrl  (subsequent)
+                  │  Headers: proxy_*, sf_*
+                  │  ← { totalSize, done, nextRecordsUrl?, records[] }
                   ▼
-       App\Services\RForce\RForceClient        (HTTP, auth, retry)
+       App\Services\RForce\RForceClient        (HTTP, headers, retry)
                   │
                   ▼
-       App\Services\RForce\RForceQueryExecutor  (SOQL paging + filters)
+       App\Services\RForce\RForceQueryExecutor  (execute / executePaginated)
                   │
                   ▼
        App\Services\RForce\RForceSyncManager    (hash diff + upsert)
@@ -172,17 +269,17 @@ change history. Each `sync_runs` row captures the exact SOQL that ran.
        raw_rforce_records  (payload + payload_hash + first/last_seen_at)
                   │
                   ▼
-       App\Services\RForce\Transformers\*       (mapping + extras → JSON)
+       App\Services\RForce\Transformers\*       (optional, per-dataset)
                   │
                   ▼
-       normalized_accounts / contacts / opportunities / ...
+       normalized_* tables (only for datasets with transformers)
                   │
         ┌─────────┴─────────────┐
         ▼                       ▼
   /api/internal/* (REST)   DatasetExporterInterface
                                   │
                                   ▼
-                            Google Sheets (future)
+                            Google Sheets (optional)
 ```
 
 ## Database Schema Overview
@@ -198,10 +295,10 @@ The heart of the SOQL-first model.
 | column              | purpose |
 |---------------------|---------|
 | `external_source_id`| Which source to run against |
-| `name` (unique)     | Human reference (`accounts.all`) |
+| `name` (unique)     | Human reference (`accounts.smoke`) |
 | `description`       | Free text shown in the admin UI |
-| `soql`              | The query to execute |
-| `target_object`     | Drives transformer lookup + `raw_rforce_records.object_type` |
+| `soql`              | The query to execute (may include placeholders) |
+| `target_dataset`    | Business-named bucket (`accounts`, `orders`, ...). Drives the transformer lookup |
 | `transformer_class` | Optional explicit override |
 | `enabled`           | Scheduler/CLI skip disabled rows |
 | `schedule`          | Cron expression; null = manual only |
@@ -214,7 +311,7 @@ One row per execution.
 |-----------------------|---------|
 | `external_source_id`  | FK |
 | `query_definition_id` | FK (nullable for ad-hoc) |
-| `object_type`         | Mirrors QueryDefinition.target_object |
+| `target_dataset`      | Mirrors QueryDefinition.target_dataset |
 | `soql`                | The exact SOQL that ran (snapshot) |
 | `status`              | enum: pending/running/succeeded/partial/failed/cancelled |
 | `since`               | Incremental filter cursor used |
@@ -224,13 +321,14 @@ One row per execution.
 | `records_changed`     | Existing rows with different hash |
 | `records_skipped`     | Existing rows with matching hash |
 | `records_failed`      | See `sync_errors` |
-| `records_fetched` / `records_upserted` | Legacy aggregates kept for older readers |
 | `started_at` / `finished_at` / `duration_ms` | Timing |
 | `error_message`       | Last error summary |
 | `meta`                | JSON: trigger source, dry_run flag, etc. |
 
 ### `sync_errors`
-Per-record errors with classification (`gateway`/`transform`/`config`/...).
+Per-record errors with classification (`gateway`/`transform`/`malformed`/`config`/...).
+Every gateway failure, malformed record, missing transformer config, and
+per-record transform exception lands here.
 
 ### `raw_rforce_records`
 Append-on-change ledger of every payload we've ever pulled.
@@ -240,57 +338,38 @@ Append-on-change ledger of every payload we've ever pulled.
 | `external_source_id`   | Source system |
 | `last_sync_run_id`     | Most recent run that touched this row |
 | `query_definition_id`  | Which saved query produced it |
-| `object_type`          | Logical bucket (Account, Contact, ...) |
-| `external_id`          | Salesforce Id |
+| `source_object_type`   | record.attributes.type (when present) |
+| `source_url`           | record.attributes.url (when present) |
+| `external_id`          | record.Id |
 | `payload`              | Raw JSON from the gateway |
 | `payload_hash`         | SHA-256 of payload (change detection key) |
-| `external_modified_at` | Salesforce `LastModifiedDate` if present |
-| `fetched_at`           | Legacy field, now equivalent to last_seen_at |
 | `first_seen_at`        | When we first observed this external_id |
 | `last_seen_at`         | When we most recently observed it |
 | `last_synced_at`       | When the normalized row was last derived |
 
-Unique on `(external_source_id, object_type, external_id)`.
-Indexes on `payload_hash`, `(query_definition_id, last_seen_at)`,
-`(object_type, last_seen_at)`.
+Unique on `(external_source_id, external_id)`. Indexes on `payload_hash`,
+`(query_definition_id, last_seen_at)`, `(source_object_type, last_seen_at)`.
 
 This shape supports **replaying transformations without re-querying
 Salesforce** — point a transformer at a `last_sync_run_id` slice (or all rows)
 and re-derive normalized tables.
 
-### `normalized_accounts` / `_contacts` / `_opportunities`
-Promoted columns plus an `extra` JSON column that catches anything not yet
-first-classed. Unique on `(external_source_id, external_id)`. Add a new
-column by writing a migration; the transformer's `promotedKeys()` list moves
-the value out of `extra` automatically.
+### Optional normalized tables
+`normalized_accounts`, `normalized_contacts`, `normalized_opportunities` are
+examples of dataset-specific normalized projections — they exist because the
+matching `AccountTransformer` / `ContactTransformer` / `OpportunityTransformer`
+classes are registered in `config('rforce.datasets')`. New datasets follow
+the same pattern: write a transformer + a migration + register it in config,
+and any `QueryDefinition` with that `target_dataset` will flow through it.
 
-## Future Google Sheets Integration
+## Google Sheets Integration (optional)
 
 ```
 MySQL → DatasetExporterInterface → GoogleSheetsExporter → Google Sheet
 ```
 
-The contract is in place today:
-
-- `App\Services\Export\Contracts\DatasetExporterInterface` is the
-  vendor-neutral seam (`export()`, `name()`, `isEnabled()`).
-- `App\Services\Sheets\GoogleSheetsExporter implements SheetsExporter
-  extends DatasetExporterInterface`.
-- `ExportDatasetToGoogleSheetsJob` is already wired and scheduled (daily) —
-  it no-ops while disabled.
-
-To finish the Sheets integration:
-
-1. `composer require google/apiclient`
-2. Drop a service-account JSON at `GOOGLE_SHEETS_CREDENTIALS_PATH`.
-3. Replace the body of `GoogleSheetsExporter::export()` with
-   `Google_Service_Sheets::values->update()` (a TODO block in the class
-   sketches the exact code).
-4. Flip `GOOGLE_SHEETS_ENABLED=true`.
-
-Sheets is intentionally a write-only sink. The platform never reads from
-Sheets — MySQL is the source of truth. This separation is enforced at the
-interface level: `DatasetExporterInterface` has no `read()` method.
+Sheets is a write-only sink. The platform never reads from Sheets — MySQL is
+the source of truth.
 
 ## Deployment Notes (Laravel Cloud)
 
@@ -304,47 +383,42 @@ interface level: `DatasetExporterInterface` has no `read()` method.
 - **Scheduler.** Laravel Cloud's scheduled-job runner picks up
   `routes/console.php`. Per-definition cron is registered dynamically — the
   process only needs `schedule:run` every minute.
-- **Cache.** Auth tokens are cached. Laravel Cloud's Redis addon is the
-  best fit; the in-memory file cache works for single-instance dev.
-- **Secrets.** `RFORCE_*`, `GOOGLE_SHEETS_*`, and `DB_PASSWORD` belong in
+- **Secrets.** `RFORCE_PROXY_*`, `RFORCE_SF_*`, and `DB_PASSWORD` belong in
   the Laravel Cloud secret manager — never in `.env` committed to source.
+- **Per-environment URLs.** Set `RFORCE_ENVIRONMENT=stage` (or `prod`) on
+  the corresponding Laravel Cloud environment so the gateway URL flips
+  automatically. `RFORCE_BASE_URL` is optional — set it only when you want
+  to override the default for that environment.
 - **Migrations.** `php artisan migrate --force` as a Laravel Cloud release
   hook. The seeder `QueryDefinitionSeeder` is idempotent and safe to run on
   every deploy if you want SOQL changes to ship via code review.
 - **Health.** `/up` is the framework's built-in health endpoint, configured
   in `bootstrap/app.php`. Point Laravel Cloud's health check at it.
 - **Observability.** Sync runs + errors are first-class tables — the admin
-  dashboard at `/admin` is sufficient for the foreseeable future. Pipe
-  `sync_errors` to your alerting tool (a 1-line job is enough).
+  dashboard at `/admin` surfaces both. Pipe `sync_errors` to your alerting
+  tool (a 1-line job is enough).
 
-## Notable Decisions Diverging from the Prototype
+## Notable Decisions
 
-1. **Removed `sync('Account')` / `sync('Contact')` commands** in favor of
-   `rforce:sync <queryId>`. Object names live in `QueryDefinition`, not
-   command signatures. (Old artisan signatures were a closed set.)
+1. **`RForceConnector.executeSoql(...)` became `query()` + `queryMore()`**.
+   The contract intentionally mirrors the Salesforce REST shape the gateway
+   forwards, which makes the wire-level behavior easy to reason about and
+   the pagination semantics impossible to miswire.
 
-2. **`RForceQueryService` was split into two** — `RForceQueryExecutor`
-   (pagination + SOQL helpers, no DB) and `RForceSyncManager` (orchestration,
-   raw upserts, change detection). This keeps the executor reusable for
-   read-only `rforce:query` dry runs.
+2. **No client-side Salesforce auth.** MuleSoft owns the OAuth dance. The
+   former `RForceAuthenticator` and its `static_token` / `oauth_*` strategies
+   were removed entirely. There is one credential set per environment, all
+   sent as HTTP headers.
 
-3. **`RForceConnector.query(object, filters)` became `executeSoql(soql)`**.
-   Filters are now constructed in the executor (`buildSoql`) rather than
-   translated by the connector. The connector knows nothing about Salesforce
-   semantics — only HTTP.
+3. **`target_dataset` instead of `target_object`.** Datasets are business-
+   named buckets the platform feeds (accounts, orders, ...), decoupled from
+   Salesforce object names. A single dataset can blend multiple SF objects;
+   a single SF object can feed multiple datasets.
 
-4. **`sync_runs` keeps legacy `records_fetched` / `records_upserted` columns**
-   in addition to the new received/inserted/changed/skipped buckets. The
-   internal API exposes both shapes (`records.received` plus
-   `records.fetched`) so older consumers don't break.
+4. **`raw_rforce_records` is keyed on `(source, external_id)`.** Salesforce
+   Ids are globally unique within a source, so source_object_type can be
+   pure metadata. This avoids the NULL-uniqueness footguns of a 3-column key.
 
-5. **`raw_rforce_records.fetched_at` is preserved**, now equivalent to
-   `last_seen_at`. Existing data isn't migrated; new code writes both.
-
-6. **The admin dashboard uses Tailwind via CDN**, not Vite. The dashboard is
-   internal-only and rarely viewed; a build step would be friction without
-   meaningful benefit at this size. Swap for Vite if the surface grows.
-
-7. **No auth on `/admin` or `/api/internal/*` yet.** Gating belongs to
-   deployment, not the prototype. Add `auth:sanctum` middleware (and an IP
-   allowlist) before the first non-developer touches it.
+5. **No two-way sync.** This is a one-way reader. The gateway has no
+   documented integration that writes back into rForce/Salesforce at this
+   time, and the architecture is deliberately structured around that.

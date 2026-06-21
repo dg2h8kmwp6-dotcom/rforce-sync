@@ -2,32 +2,62 @@
 
 declare(strict_types=1);
 
+/*
+|--------------------------------------------------------------------------
+| rForce / Salesforce — MuleSoft Data Gateway
+|--------------------------------------------------------------------------
+|
+| The application does NOT authenticate against Salesforce directly. It
+| sends SOQL through the Renewal by Andersen MuleSoft Data Gateway:
+|
+|     GET  {RFORCE_BASE_URL}?q=<SOQL>
+|     Headers: proxy_client_id, proxy_client_secret,
+|              sf_client_id, sf_client_secret, sf_version,
+|              sf_environment_url (optional)
+|
+| MuleSoft handles the Salesforce OAuth handshake and returns the standard
+| Salesforce REST query response. Pagination uses Salesforce-style
+| `nextRecordsUrl`; on follow-up calls we send it back via the
+| `nextRecordsUrl` header (no `q` parameter).
+|
+*/
+
+$environments = [
+    'test'  => 'https://it1apitst2.andersencorp.com/api/rforce/control-layer/query',
+    'stage' => 'https://it1apistg2.andersencorp.com/api/rforce/control-layer/query',
+    'prod'  => 'https://it1api2.andersencorp.com/api/rforce/control-layer/query',
+];
+
+$environment = strtolower((string) env('RFORCE_ENVIRONMENT', 'stage'));
+$baseUrl     = (string) env('RFORCE_BASE_URL', $environments[$environment] ?? $environments['stage']);
+
 return [
+
+    'environment'   => $environment,
+    'environments'  => $environments,
+
+    // The full Data Gateway query endpoint. Defaults to whichever URL the
+    // selected environment maps to. Trailing slash is meaningful here —
+    // it's a single endpoint, not a base path.
+    'base_url'      => $baseUrl,
 
     /*
     |--------------------------------------------------------------------------
-    | Gateway endpoints
+    | Credentials
     |--------------------------------------------------------------------------
     |
-    | rForce/Salesforce is reached through a gateway. The exact contract is
-    | still TBD; treat these values as the only place URLs should live.
+    | proxy_*  → MuleSoft client credentials (authenticate to the gateway).
+    | sf_*     → Salesforce-side credentials that MuleSoft forwards.
+    | sf_environment_url → optional override (e.g. for a different SF org).
     |
     */
 
-    'base_url' => rtrim((string) env('RFORCE_BASE_URL', ''), '/'),
-
-    'auth' => [
-        // oauth_client_credentials | oauth_password | static_token
-        'strategy'      => env('RFORCE_AUTH_STRATEGY', 'oauth_client_credentials'),
-        'url'           => env('RFORCE_AUTH_URL'),
-        'client_id'     => env('RFORCE_CLIENT_ID'),
-        'client_secret' => env('RFORCE_CLIENT_SECRET'),
-        'username'      => env('RFORCE_USERNAME'),
-        'password'      => env('RFORCE_PASSWORD'),
-        'static_token'  => env('RFORCE_STATIC_TOKEN'),
-        // How long (in seconds) before token expiry to consider it stale and refresh.
-        'refresh_skew'  => 60,
-    ],
+    'proxy_client_id'     => env('RFORCE_PROXY_CLIENT_ID'),
+    'proxy_client_secret' => env('RFORCE_PROXY_CLIENT_SECRET'),
+    'sf_client_id'        => env('RFORCE_SF_CLIENT_ID'),
+    'sf_client_secret'    => env('RFORCE_SF_CLIENT_SECRET'),
+    'sf_version'          => env('RFORCE_SF_VERSION', 'v60.0'),
+    'sf_environment_url'  => env('RFORCE_SF_ENVIRONMENT_URL'),
 
     /*
     |--------------------------------------------------------------------------
@@ -35,48 +65,12 @@ return [
     |--------------------------------------------------------------------------
     */
 
-    'http' => [
-        'timeout'        => (int) env('RFORCE_TIMEOUT', 30),
-        'retry_attempts' => (int) env('RFORCE_RETRY_ATTEMPTS', 3),
-        // milliseconds between retries
-        'retry_sleep'    => (int) env('RFORCE_RETRY_SLEEP', 500),
-        // HTTP statuses considered transient and worth retrying
-        'retry_when'     => [408, 425, 429, 500, 502, 503, 504],
-    ],
-
-    /*
-    |--------------------------------------------------------------------------
-    | Transformer fallback registry
-    |--------------------------------------------------------------------------
-    |
-    | The platform is query-driven via QueryDefinitions; QueryDefinition.
-    | transformer_class is the primary way to declare how rows for a given
-    | saved query get normalized.
-    |
-    | This map is the *fallback* used when QueryDefinition.transformer_class is
-    | null — the runtime looks up `target_object` here. Add a row for any new
-    | Salesforce object (including custom `*__c` ones) you want auto-normalized.
-    |
-    | Removing an entry does NOT break sync — raw rows still land in
-    | raw_rforce_records. It just means no normalized table is populated for
-    | that object_type unless the QueryDefinition names a transformer directly.
-    |
-    */
-
-    'objects' => [
-        'Account' => [
-            'transformer' => \App\Services\RForce\Transformers\AccountTransformer::class,
-            'model'       => \App\Models\NormalizedAccount::class,
-        ],
-        'Contact' => [
-            'transformer' => \App\Services\RForce\Transformers\ContactTransformer::class,
-            'model'       => \App\Models\NormalizedContact::class,
-        ],
-        'Opportunity' => [
-            'transformer' => \App\Services\RForce\Transformers\OpportunityTransformer::class,
-            'model'       => \App\Models\NormalizedOpportunity::class,
-        ],
-    ],
+    'timeout'        => (int) env('RFORCE_TIMEOUT', 300),
+    'retry_attempts' => (int) env('RFORCE_RETRY_ATTEMPTS', 3),
+    // milliseconds between retries
+    'retry_sleep'    => (int) env('RFORCE_RETRY_SLEEP', 10000),
+    // HTTP statuses considered transient and worth retrying.
+    'retry_when'     => [408, 425, 429, 500, 502, 503, 504],
 
     /*
     |--------------------------------------------------------------------------
@@ -85,14 +79,45 @@ return [
     */
 
     'sync' => [
-        // Page size requested from the gateway when paginating queries.
-        'page_size'      => 500,
         // Max records per sync run (null = unbounded). Useful for safety in dev.
-        'max_per_run'    => null,
+        'max_per_run' => null,
         // Queue used for sync jobs.
-        'queue'          => env('RFORCE_QUEUE', 'default'),
+        'queue'       => env('RFORCE_QUEUE', 'default'),
         // Identifier used to tag rows in `external_sources`.
-        'source_name'    => 'rforce',
+        'source_name' => 'rforce',
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | Transformer fallback registry
+    |--------------------------------------------------------------------------
+    |
+    | Optional. The primary way to declare how a dataset gets normalized is
+    | QueryDefinition.transformer_class. This map is the fallback used when
+    | transformer_class is null — the runtime looks up `target_dataset` here.
+    |
+    | Removing an entry does NOT break sync: raw rows still land in
+    | raw_rforce_records. It just means no normalized table is populated for
+    | that dataset unless the QueryDefinition names a transformer directly.
+    |
+    | Datasets are business-named, not Salesforce-object-named: the platform
+    | is query-driven, not object-driven.
+    |
+    */
+
+    'datasets' => [
+        'accounts' => [
+            'transformer' => \App\Services\RForce\Transformers\AccountTransformer::class,
+            'model'       => \App\Models\NormalizedAccount::class,
+        ],
+        'contacts' => [
+            'transformer' => \App\Services\RForce\Transformers\ContactTransformer::class,
+            'model'       => \App\Models\NormalizedContact::class,
+        ],
+        'opportunities' => [
+            'transformer' => \App\Services\RForce\Transformers\OpportunityTransformer::class,
+            'model'       => \App\Models\NormalizedOpportunity::class,
+        ],
     ],
 
 ];

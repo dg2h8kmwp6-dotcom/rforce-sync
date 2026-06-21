@@ -21,10 +21,11 @@ use Throwable;
  *
  * Resolves the transformer in this order:
  *   1. QueryDefinition.transformer_class (if set on the SyncRun's query)
- *   2. config('rforce.objects.{object_type}.transformer')
+ *   2. config('rforce.datasets.{target_dataset}.transformer')
  *
- * If neither resolves to a real class, the run is marked failed with a
- * 'config' error — better than silently skipping normalization.
+ * If neither resolves to a real class, the run finishes successfully with no
+ * transformed rows — the raw data is still safely in raw_rforce_records.
+ * Add a transformer later and replay against the same SyncRun.
  */
 class TransformRForceRecordsJob implements ShouldQueue
 {
@@ -45,24 +46,26 @@ class TransformRForceRecordsJob implements ShouldQueue
             ->with(['externalSource', 'queryDefinition'])
             ->findOrFail($this->syncRunId);
 
-        $source     = $run->externalSource;
-        $objectType = $run->object_type ?? $run->queryDefinition?->target_object;
+        $source        = $run->externalSource;
+        $targetDataset = $run->target_dataset ?? $run->queryDefinition?->target_dataset;
 
         $transformerCl = $run->queryDefinition?->resolvedTransformerClass();
-        if ($transformerCl === null && $objectType !== null) {
-            $cfg = config("rforce.objects.{$objectType}.transformer");
+        if ($transformerCl === null && $targetDataset !== null) {
+            $cfg = config("rforce.datasets.{$targetDataset}.transformer");
             if (is_string($cfg) && class_exists($cfg)) {
                 $transformerCl = $cfg;
             }
         }
 
         if ($transformerCl === null) {
-            $runs->recordError(
-                $run,
-                "No transformer registered for object [{$objectType}]",
-                'config',
-            );
-            $runs->fail($run, new \RuntimeException("Missing transformer for {$objectType}"));
+            // No transformer is fine — raw rows are the only required output.
+            // Stamp last_synced_at so downstream consumers can tell the rows
+            // were handled by this run, then finish cleanly.
+            RawRforceRecord::query()
+                ->where('external_source_id', $source->id)
+                ->where('last_sync_run_id', $run->id)
+                ->update(['last_synced_at' => Carbon::now()]);
+            $runs->finish($run);
             return;
         }
 
@@ -71,12 +74,10 @@ class TransformRForceRecordsJob implements ShouldQueue
         try {
             RawRforceRecord::query()
                 ->where('external_source_id', $source->id)
-                ->where('object_type', $objectType)
                 ->where('last_sync_run_id', $run->id)
                 ->chunkById(500, function ($chunk) use ($transformer, $run, $source): void {
                     $transformer->transformBatch($chunk, $run, $source);
 
-                    // Stamp last_synced_at on the rows we just normalized.
                     RawRforceRecord::query()
                         ->whereIn('id', $chunk->pluck('id')->all())
                         ->update(['last_synced_at' => Carbon::now()]);

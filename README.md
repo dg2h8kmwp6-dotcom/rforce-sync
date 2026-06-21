@@ -1,59 +1,125 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# rForce Sync
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+Internal Laravel data platform that pulls SOQL-defined slices of
+rForce/Salesforce through the **Renewal by Andersen MuleSoft Data Gateway**
+and lands them in MySQL for downstream APIs, dashboards, and optional
+Google Sheets export.
 
-## About Laravel
+MySQL is the system of record. There is no write-back to rForce.
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+## Required environment variables
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+```ini
+# Gateway environment: test | stage | prod
+RFORCE_ENVIRONMENT=stage
 
-## Learning Laravel
+# Optional override. Leave blank to use the environment default below.
+#   test:  https://it1apitst2.andersencorp.com/api/rforce/control-layer/query
+#   stage: https://it1apistg2.andersencorp.com/api/rforce/control-layer/query
+#   prod:  https://it1api2.andersencorp.com/api/rforce/control-layer/query
+RFORCE_BASE_URL=
 
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework. You can also check out [Laravel Learn](https://laravel.com/learn), where you will be guided through building a modern Laravel application.
+# MuleSoft proxy credentials.
+RFORCE_PROXY_CLIENT_ID=
+RFORCE_PROXY_CLIENT_SECRET=
 
-If you don't feel like reading, [Laracasts](https://laracasts.com) can help. Laracasts contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
+# Salesforce credentials the gateway forwards.
+RFORCE_SF_CLIENT_ID=
+RFORCE_SF_CLIENT_SECRET=
 
-## Laravel Sponsors
+# Salesforce REST API version. Default v60.0; v58.0 also valid.
+RFORCE_SF_VERSION=v60.0
 
-We would like to extend our thanks to the following sponsors for funding Laravel development. If you are interested in becoming a sponsor, please visit the [Laravel Partners program](https://partners.laravel.com).
+# Optional. Set only if MuleSoft needs an explicit Salesforce URL.
+RFORCE_SF_ENVIRONMENT_URL=
 
-### Premium Partners
+# HTTP behavior.
+RFORCE_TIMEOUT=300
+RFORCE_RETRY_ATTEMPTS=3
+RFORCE_RETRY_SLEEP=10000
 
-- **[Vehikl](https://vehikl.com)**
-- **[Tighten Co.](https://tighten.co)**
-- **[Kirschbaum Development Group](https://kirschbaumdevelopment.com)**
-- **[64 Robots](https://64robots.com)**
-- **[Curotec](https://www.curotec.com/services/technologies/laravel)**
-- **[DevSquad](https://devsquad.com/hire-laravel-developers)**
-- **[Redberry](https://redberry.international/laravel-development)**
-- **[Active Logic](https://activelogic.com)**
+# Queue used for sync jobs.
+RFORCE_QUEUE=default
+```
 
-## Contributing
+See `.env.example` for the full set including DB, queue, and Google Sheets
+variables.
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+## Local setup
 
-## Code of Conduct
+```bash
+git clone <repo> rforce-sync
+cd rforce-sync
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+cp .env.example .env
+composer install
+php artisan key:generate
 
-## Security Vulnerabilities
+# Local default points at stage. Fill in RFORCE_PROXY_* and RFORCE_SF_*
+# from the MuleSoft team before running anything against the gateway.
+$EDITOR .env
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+php artisan migrate
+php artisan db:seed --class=Database\\Seeders\\QueryDefinitionSeeder
 
-## License
+# Smoke test: hits the gateway with `SELECT Name FROM Account LIMIT 1`.
+php artisan rforce:test-connection
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+# Ad-hoc SOQL — no DB writes.
+php artisan rforce:query "SELECT Name FROM Account LIMIT 10"
+
+# Run a saved QueryDefinition end-to-end (raw upsert + transform).
+php artisan rforce:run-query accounts.smoke --inline
+
+# Run every enabled saved query.
+php artisan rforce:sync --inline
+```
+
+## Commands
+
+| command                                          | purpose |
+|--------------------------------------------------|---------|
+| `php artisan rforce:test-connection`             | Verify the gateway is reachable and credentials are accepted. Override with `--soql=…` for a different probe. |
+| `php artisan rforce:query "<SOQL>"`              | Stream the records produced by an ad-hoc SOQL to stdout. No DB writes. |
+| `php artisan rforce:run-query <id\|name>`        | Sync a single saved QueryDefinition. Add `--inline`, `--dry-run`, `--since=…`, `--limit=…` as needed. |
+| `php artisan rforce:sync`                        | Sync every enabled QueryDefinition. Add `--inline` or `--dry-run`. |
+
+## Example test query
+
+```bash
+php artisan rforce:query "SELECT Id, Name FROM Account WHERE LastModifiedDate = TODAY"
+```
+
+## SOQL placeholders
+
+`QueryDefinition.soql` may contain a fixed set of `{{...}}` placeholders.
+The runtime substitutes SOQL-typed literals — raw user input is never
+interpolated.
+
+| token              | substituted with |
+|--------------------|------------------|
+| `{{last_sync_at}}` | `--since` arg → `QueryDefinition.last_run_at` → epoch fallback, ISO-8601 |
+| `{{now}}`          | `Carbon::now()` at execution time, ISO-8601 |
+
+Example seed:
+
+```sql
+SELECT FIELDS(ALL) FROM Order WHERE LastModifiedDate > {{last_sync_at}}
+```
+
+## Deployment notes (Laravel Cloud)
+
+- Set `RFORCE_ENVIRONMENT=stage` (or `prod`) per Laravel Cloud environment
+  so the gateway URL flips automatically. `RFORCE_BASE_URL` is optional —
+  set it only when overriding the default.
+- Put `RFORCE_PROXY_*`, `RFORCE_SF_*`, and `DB_PASSWORD` in the Laravel
+  Cloud secret manager. Never commit them.
+- Release hook: `php artisan migrate --force`. The seeder is idempotent and
+  safe to re-run if you want SOQL changes shipped via code review.
+- Add a queue worker process (`php artisan queue:work`) for
+  `RunQueryDefinitionJob` + `TransformRForceRecordsJob`.
+- Add a `php artisan schedule:run` cron so per-`QueryDefinition` schedules
+  defined in `routes/console.php` fire.
+- Health check: point Laravel Cloud at `/up`.

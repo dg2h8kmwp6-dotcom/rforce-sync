@@ -18,7 +18,7 @@ class QueryDefinitionResource extends JsonResource
             'name'              => $this->name,
             'description'       => $this->description,
             'soql'              => $this->soql,
-            'target_object'     => $this->target_object,
+            'target_dataset'    => $this->target_dataset,
             'transformer_class' => $this->transformer_class,
             'enabled'           => $this->enabled,
             'schedule'          => $this->schedule,

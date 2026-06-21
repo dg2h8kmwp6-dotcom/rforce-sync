@@ -16,9 +16,9 @@ class QueryDefinitionController extends Controller
     public function index(Request $request): AnonymousResourceCollection
     {
         $validated = $request->validate([
-            'enabled'       => ['nullable', 'boolean'],
-            'target_object' => ['nullable', 'string', 'max:64'],
-            'per_page'      => ['nullable', 'integer', 'min:1', 'max:200'],
+            'enabled'        => ['nullable', 'boolean'],
+            'target_dataset' => ['nullable', 'string', 'max:64'],
+            'per_page'       => ['nullable', 'integer', 'min:1', 'max:200'],
         ]);
 
         $query = QueryDefinition::query()->orderBy('name');
@@ -26,8 +26,8 @@ class QueryDefinitionController extends Controller
         if (array_key_exists('enabled', $validated)) {
             $query->where('enabled', (bool) $validated['enabled']);
         }
-        if (! empty($validated['target_object'])) {
-            $query->where('target_object', $validated['target_object']);
+        if (! empty($validated['target_dataset'])) {
+            $query->where('target_dataset', $validated['target_dataset']);
         }
 
         return QueryDefinitionResource::collection(

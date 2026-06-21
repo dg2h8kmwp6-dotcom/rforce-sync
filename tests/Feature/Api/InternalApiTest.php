@@ -56,7 +56,7 @@ class InternalApiTest extends TestCase
             'external_source_id' => $source->id,
             'name'               => 'accounts.all',
             'soql'               => 'SELECT Id, Name FROM Account',
-            'target_object'      => 'Account',
+            'target_dataset'     => 'accounts',
             'enabled'            => true,
             'schedule'           => '0 * * * *',
         ]);
@@ -65,7 +65,7 @@ class InternalApiTest extends TestCase
             ->assertOk()
             ->assertJsonCount(1, 'data')
             ->assertJsonPath('data.0.name', 'accounts.all')
-            ->assertJsonPath('data.0.target_object', 'Account')
+            ->assertJsonPath('data.0.target_dataset', 'accounts')
             ->assertJsonPath('data.0.schedule', '0 * * * *');
     }
 
@@ -73,7 +73,7 @@ class InternalApiTest extends TestCase
     {
         $manager = new SyncRunManager();
         $source  = $manager->defaultSource();
-        $run     = $manager->start($source, 'Account');
+        $run     = $manager->start($source, 'accounts');
         $manager->incrementReceived($run, 50);
         $manager->incrementInserted($run, 20);
         $manager->incrementChanged($run, 10);

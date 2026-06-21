@@ -24,16 +24,12 @@ use Throwable;
  *   - changed   = existing raw rows where payload hash differed
  *   - skipped   = existing raw rows where payload hash matched (no-op)
  *   - failed    = errors during ingest/transform
- *
- * Legacy counters (records_fetched / records_upserted) are still maintained
- * for backwards compatibility with downstream readers; new code should prefer
- * the named buckets above.
  */
 class SyncRunManager
 {
     public function start(
         ExternalSource $source,
-        ?string $objectType = null,
+        ?string $targetDataset = null,
         ?DateTimeInterface $since = null,
         ?int $limit = null,
         array $meta = [],
@@ -43,7 +39,7 @@ class SyncRunManager
         return SyncRun::query()->create([
             'external_source_id'  => $source->id,
             'query_definition_id' => $queryDefinition?->id,
-            'object_type'         => $objectType,
+            'target_dataset'      => $targetDataset,
             'soql'                => $soql,
             'status'              => SyncStatus::Running,
             'since'               => $since,
@@ -53,19 +49,12 @@ class SyncRunManager
         ]);
     }
 
-    public function incrementFetched(SyncRun $run, int $by): void
-    {
-        $run->increment('records_fetched', $by);
-    }
-
     public function incrementReceived(SyncRun $run, int $by): void
     {
         if ($by <= 0) {
             return;
         }
         $run->increment('records_received', $by);
-        // Mirror to the legacy field so older readers keep working.
-        $run->increment('records_fetched', $by);
     }
 
     public function incrementInserted(SyncRun $run, int $by): void
@@ -74,7 +63,6 @@ class SyncRunManager
             return;
         }
         $run->increment('records_inserted', $by);
-        $run->increment('records_upserted', $by);
     }
 
     public function incrementChanged(SyncRun $run, int $by): void
@@ -83,7 +71,6 @@ class SyncRunManager
             return;
         }
         $run->increment('records_changed', $by);
-        $run->increment('records_upserted', $by);
     }
 
     public function incrementSkipped(SyncRun $run, int $by): void
@@ -92,11 +79,6 @@ class SyncRunManager
             return;
         }
         $run->increment('records_skipped', $by);
-    }
-
-    public function incrementUpserted(SyncRun $run, int $by): void
-    {
-        $run->increment('records_upserted', $by);
     }
 
     public function incrementFailed(SyncRun $run, int $by): void
@@ -116,7 +98,7 @@ class SyncRunManager
         ?string $externalId = null,
     ): void {
         $run->errors()->create([
-            'object_type' => $objectType ?? $run->object_type,
+            'object_type' => $objectType ?? $run->target_dataset,
             'external_id' => $externalId,
             'category'    => $category,
             'message'     => $message,
@@ -132,14 +114,18 @@ class SyncRunManager
     {
         $run->refresh();
 
+        $upserted = $run->records_inserted + $run->records_changed + $run->records_skipped;
+
         $resolved = $status ?? match (true) {
-            $run->records_failed > 0 && $run->records_upserted === 0 && $run->records_received === 0 => SyncStatus::Failed,
-            $run->records_failed > 0                                                                  => SyncStatus::Partial,
-            default                                                                                   => SyncStatus::Succeeded,
+            $run->records_failed > 0 && $upserted === 0 && $run->records_received === 0 => SyncStatus::Failed,
+            $run->records_failed > 0                                                    => SyncStatus::Partial,
+            default                                                                     => SyncStatus::Succeeded,
         };
 
         $finishedAt = Carbon::now();
-        $duration   = $run->started_at !== null ? (int) ($finishedAt->getPreciseTimestamp(3) - $run->started_at->getPreciseTimestamp(3)) : null;
+        $duration   = $run->started_at !== null
+            ? (int) ($finishedAt->getPreciseTimestamp(3) - $run->started_at->getPreciseTimestamp(3))
+            : null;
 
         $run->update([
             'status'        => $resolved,
@@ -170,7 +156,7 @@ class SyncRunManager
         return ExternalSource::query()->firstOrCreate(
             ['name' => (string) config('rforce.sync.source_name', 'rforce')],
             [
-                'label'  => 'rForce / Salesforce gateway',
+                'label'  => 'rForce / Salesforce via MuleSoft Data Gateway',
                 'config' => ['base_url' => config('rforce.base_url')],
                 'active' => true,
             ],

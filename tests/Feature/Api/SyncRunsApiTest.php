@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Tests\Feature\Api;
 
 use App\Enums\SyncStatus;
-use App\Models\SyncRun;
 use App\Services\Sync\SyncRunManager;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Tests\TestCase;
@@ -19,8 +18,8 @@ class SyncRunsApiTest extends TestCase
         $manager = new SyncRunManager();
         $source  = $manager->defaultSource();
 
-        $manager->start($source, 'Account');
-        $manager->start($source, 'Contact');
+        $manager->start($source, 'accounts');
+        $manager->start($source, 'contacts');
 
         $response = $this->getJson('/api/internal/sync-runs');
 
@@ -33,7 +32,7 @@ class SyncRunsApiTest extends TestCase
     {
         $manager = new SyncRunManager();
         $source  = $manager->defaultSource();
-        $run     = $manager->start($source, 'Account');
+        $run     = $manager->start($source, 'accounts');
         $manager->recordError($run, 'boom', 'transform');
 
         $response = $this->getJson("/api/internal/sync-runs/{$run->id}");
@@ -43,16 +42,16 @@ class SyncRunsApiTest extends TestCase
             ->assertJsonPath('data.errors.0.message', 'boom');
     }
 
-    public function test_index_filters_by_object_type(): void
+    public function test_index_filters_by_target_dataset(): void
     {
         $manager = new SyncRunManager();
         $source  = $manager->defaultSource();
-        $manager->start($source, 'Account');
-        $manager->start($source, 'Contact');
+        $manager->start($source, 'accounts');
+        $manager->start($source, 'contacts');
 
-        $this->getJson('/api/internal/sync-runs?object_type=Contact')
+        $this->getJson('/api/internal/sync-runs?target_dataset=contacts')
             ->assertOk()
             ->assertJsonCount(1, 'data')
-            ->assertJsonPath('data.0.object_type', 'Contact');
+            ->assertJsonPath('data.0.target_dataset', 'contacts');
     }
 }

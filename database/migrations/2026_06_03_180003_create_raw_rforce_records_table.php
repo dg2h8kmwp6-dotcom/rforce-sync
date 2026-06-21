@@ -23,21 +23,34 @@ return new class extends Migration
                 ->constrained('sync_runs')
                 ->nullOnDelete();
 
-            $table->string('object_type');           // Account, Contact, ...
-            $table->string('external_id');           // Salesforce Id
-            $table->json('payload');                 // Raw gateway response for this record
-            $table->string('payload_hash', 64)->nullable(); // SHA-256 of payload for change detection
+            // Salesforce object type, copied from record.attributes.type when
+            // present. Nullable — some queries (aggregates, sub-selects) don't
+            // return attributes blocks.
+            $table->string('source_object_type')->nullable();
 
-            // Cursor field copied off the payload so we can window incremental syncs
-            // without re-parsing JSON. Typically LastModifiedDate.
-            $table->timestamp('external_modified_at')->nullable();
+            // record.attributes.url — Salesforce's own resource path for the
+            // row, e.g. /services/data/v60.0/sobjects/Account/001.../
+            $table->string('source_url', 1024)->nullable();
 
-            $table->timestamp('fetched_at')->nullable();
+            // record.Id (top-level). Required for change detection.
+            $table->string('external_id');
+
+            // Raw Salesforce-shaped JSON record.
+            $table->json('payload');
+
+            // SHA-256 of payload, used as the change-detection key.
+            $table->string('payload_hash', 64)->nullable();
+
             $table->timestamps();
 
-            // Idempotent upsert key.
-            $table->unique(['external_source_id', 'object_type', 'external_id'], 'raw_records_source_object_external_unique');
-            $table->index(['object_type', 'external_modified_at']);
+            // Idempotent upsert key. Salesforce Ids are globally unique within
+            // a source so (source, external_id) is enough — the object-type
+            // prefix is encoded in the first 3 chars of the Id anyway.
+            $table->unique(
+                ['external_source_id', 'external_id'],
+                'raw_records_source_external_unique',
+            );
+            $table->index('source_object_type');
         });
     }
 

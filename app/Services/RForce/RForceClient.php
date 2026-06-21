@@ -5,138 +5,177 @@ declare(strict_types=1);
 namespace App\Services\RForce;
 
 use App\Services\RForce\Contracts\RForceConnector;
-use App\Services\RForce\DTO\QueryResult;
-use App\Services\RForce\Exceptions\RForceAuthException;
+use App\Services\RForce\DTO\RForceQueryResult;
 use App\Services\RForce\Exceptions\RForceException;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Factory as HttpFactory;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Throwable;
 
 /**
- * HTTP-based connector to the rForce gateway.
+ * HTTP transport to the Renewal by Andersen MuleSoft Data Gateway.
  *
- * Pure transport. Knows: URLs, auth header, retries, pagination response shape.
- * Does NOT know: which SOQL to run, what to do with the records, how to
- * orchestrate a sync. All of that lives upstack in QueryExecutor/SyncManager.
+ * The gateway exposes a single SOQL query endpoint:
  *
- * Validate against the real gateway:
- *  - Auth header (`Authorization: Bearer ...`). If the gateway uses
- *    `X-Api-Key`, change the request builder below.
- *  - Endpoint path. SOQL is POSTed to `/query` as `{"q": "..."}` here.
- *    Salesforce REST uses GET `/services/data/vXX.X/query?q=...`; tweak
- *    `executeSoql()` if the gateway prefers that.
- *  - Pagination. Salesforce returns `nextRecordsUrl`; gateways often expose
- *    a `nextPageToken`. `parseQueryResponse()` accepts both.
- *  - 401 handling: we force-refresh the token once and retry.
+ *     GET  {base_url}?q=<SOQL>
+ *
+ * Authentication is *not* handled here — MuleSoft owns the Salesforce OAuth
+ * dance internally. The client only forwards proxy + Salesforce credentials
+ * as HTTP headers and lets the gateway do the rest.
+ *
+ * Response shape mirrors the Salesforce REST query API:
+ *
+ *     { totalSize, done, nextRecordsUrl?, records: [...] }
+ *
+ * Pagination uses the `nextRecordsUrl` from the previous response, sent back
+ * as a header (no `q` parameter) per the gateway docs.
  */
 class RForceClient implements RForceConnector
 {
     /**
      * @param  array{
-     *     timeout:int,
-     *     retry_attempts:int,
-     *     retry_sleep:int,
-     *     retry_when?:array<int,int>,
-     *  }  $httpConfig
+     *     proxy_client_id?: ?string,
+     *     proxy_client_secret?: ?string,
+     *     sf_client_id?: ?string,
+     *     sf_client_secret?: ?string,
+     *     sf_version?: ?string,
+     *     sf_environment_url?: ?string,
+     *     timeout?: int,
+     *     retry_attempts?: int,
+     *     retry_sleep?: int,
+     *     retry_when?: array<int,int>,
+     *  }  $config
      */
     public function __construct(
         private readonly HttpFactory $http,
-        private readonly RForceAuthenticator $auth,
         private readonly string $baseUrl,
-        private readonly array $httpConfig,
+        private readonly array $config,
     ) {}
 
     public function ping(): bool
     {
         try {
-            $this->auth->token();
+            $this->query('SELECT Name FROM Account LIMIT 1');
             return true;
-        } catch (RForceAuthException) {
+        } catch (Throwable) {
             return false;
         }
     }
 
-    public function executeSoql(string $soql, ?string $cursor = null, ?int $pageSize = null): QueryResult
+    public function query(string $soql): RForceQueryResult
     {
-        $body = array_filter([
-            'q'        => $soql,
-            'cursor'   => $cursor,
-            'pageSize' => $pageSize,
-        ], static fn ($v): bool => $v !== null && $v !== '');
-
-        $response = $this->sendWithAuthRetry(fn (PendingRequest $req): Response =>
-            $req->post($this->url('/query'), $body)
+        $response = $this->send(fn (PendingRequest $req): Response =>
+            $req->get($this->baseUrl, ['q' => $soql])
         );
 
-        if (! $response->successful()) {
-            throw new RForceException(
-                "rForce SOQL query failed (status={$response->status()}): ".$response->body(),
-            );
-        }
+        return $this->parse($response, context: ['soql' => $soql]);
+    }
 
-        return $this->parseQueryResponse($response);
+    public function queryMore(string $nextRecordsUrl): RForceQueryResult
+    {
+        $response = $this->send(fn (PendingRequest $req): Response =>
+            $req->withHeaders(['nextRecordsUrl' => $nextRecordsUrl])->get($this->baseUrl)
+        );
+
+        return $this->parse($response, context: ['nextRecordsUrl' => $nextRecordsUrl]);
     }
 
     /**
-     * Centralized request execution: applies auth, configures retry/timeout,
-     * refreshes the token on 401, and retries once on transient HTTP statuses.
+     * Build a PendingRequest with the standard MuleSoft headers, run it
+     * through Laravel's retry helper, and bubble transport errors up as
+     * RForceException.
      *
      * @param  callable(PendingRequest):Response  $send
      */
-    private function sendWithAuthRetry(callable $send): Response
+    private function send(callable $send): Response
     {
-        $attempt = function (bool $forceRefresh) use ($send): Response {
-            $token = $this->auth->token(forceRefresh: $forceRefresh);
+        $timeout       = (int) ($this->config['timeout'] ?? 300);
+        $retryAttempts = max(1, (int) ($this->config['retry_attempts'] ?? 3));
+        $retrySleep    = (int) ($this->config['retry_sleep'] ?? 10000);
+        $retryWhen     = $this->config['retry_when'] ?? [408, 425, 429, 500, 502, 503, 504];
 
-            $request = $this->http
-                ->withToken($token)
-                ->acceptJson()
-                ->asJson()
-                ->timeout($this->httpConfig['timeout'])
-                ->retry(
-                    times:             max(1, $this->httpConfig['retry_attempts']),
-                    sleepMilliseconds: $this->httpConfig['retry_sleep'],
-                    when:              fn (Throwable $e): bool => $e instanceof \Illuminate\Http\Client\ConnectionException,
-                    throw:             false,
-                );
+        $request = $this->http
+            ->withHeaders($this->headers())
+            ->acceptJson()
+            ->timeout($timeout)
+            ->retry(
+                times:             $retryAttempts,
+                sleepMilliseconds: $retrySleep,
+                when:              static fn (Throwable $e): bool => $e instanceof ConnectionException,
+                throw:             false,
+            );
 
-            return $send($request);
-        };
-
-        $response = $attempt(false);
-
-        if ($response->status() === 401) {
-            $response = $attempt(true);
+        try {
+            $response = $send($request);
+        } catch (ConnectionException $e) {
+            throw new RForceException('Data Gateway request failed: '.$e->getMessage(), 0, $e);
         }
 
-        if (in_array($response->status(), $this->httpConfig['retry_when'] ?? [], true)) {
-            usleep($this->httpConfig['retry_sleep'] * 1000);
-            $response = $attempt(false);
+        // Manual retry on transient HTTP statuses (Http::retry only retries on
+        // transport exceptions when `throw=false`, not on bad statuses).
+        $attempts = 1;
+        while ($attempts < $retryAttempts && in_array($response->status(), $retryWhen, true)) {
+            usleep($retrySleep * 1000);
+            try {
+                $response = $send($request);
+            } catch (ConnectionException $e) {
+                throw new RForceException('Data Gateway request failed: '.$e->getMessage(), 0, $e);
+            }
+            $attempts++;
         }
 
         return $response;
     }
 
-    private function url(string $path): string
+    /**
+     * @return array<string, string>
+     */
+    private function headers(): array
     {
-        return $this->baseUrl.'/'.ltrim($path, '/');
+        $headers = [
+            'proxy_client_id'     => (string) ($this->config['proxy_client_id'] ?? ''),
+            'proxy_client_secret' => (string) ($this->config['proxy_client_secret'] ?? ''),
+            'sf_client_id'        => (string) ($this->config['sf_client_id'] ?? ''),
+            'sf_client_secret'    => (string) ($this->config['sf_client_secret'] ?? ''),
+            'sf_version'          => (string) ($this->config['sf_version'] ?? 'v60.0'),
+        ];
+
+        $envUrl = (string) ($this->config['sf_environment_url'] ?? '');
+        if ($envUrl !== '') {
+            $headers['sf_environment_url'] = $envUrl;
+        }
+
+        return $headers;
     }
 
-    private function parseQueryResponse(Response $response): QueryResult
+    /**
+     * @param  array<string,mixed>  $context
+     */
+    private function parse(Response $response, array $context = []): RForceQueryResult
     {
-        $data = (array) $response->json();
+        if (! $response->successful()) {
+            throw new RForceException(sprintf(
+                'Data Gateway returned HTTP %d: %s',
+                $response->status(),
+                $this->snippet($response->body()),
+            ));
+        }
 
-        $records = (array) ($data['records'] ?? []);
-        $cursor  = $data['nextPageToken'] ?? $data['nextRecordsUrl'] ?? null;
-        $cursor  = is_string($cursor) && $cursor !== '' ? $cursor : null;
-        $totalSize = isset($data['totalSize']) ? (int) $data['totalSize'] : null;
+        $body = $response->json();
 
-        return new QueryResult(
-            records:    array_values($records),
-            nextCursor: $cursor,
-            totalSize:  $totalSize,
-            meta:       array_diff_key($data, array_flip(['records', 'nextPageToken', 'nextRecordsUrl', 'totalSize'])),
-        );
+        if (! is_array($body)) {
+            throw new RForceException(
+                'Data Gateway returned a non-JSON response: '.$this->snippet($response->body()),
+            );
+        }
+
+        return RForceQueryResult::fromResponse($body);
+    }
+
+    private function snippet(string $body, int $max = 500): string
+    {
+        $body = trim($body);
+        return strlen($body) > $max ? substr($body, 0, $max).'…' : $body;
     }
 }

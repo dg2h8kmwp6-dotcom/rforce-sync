@@ -21,12 +21,15 @@ return new class extends Migration
 
             $table->text('soql');
 
-            // Logical bucket the resulting records belong to. Drives raw_rforce_records.object_type
-            // and the transformer lookup. Free-form (Account, Contact, ...; also custom objects).
-            $table->string('target_object')->nullable();
+            // Business-named dataset this query feeds. Drives the transformer
+            // lookup (config('rforce.datasets.{target_dataset}.transformer'))
+            // and tags the resulting raw rows. Free-form so custom datasets
+            // are a config-only addition.
+            $table->string('target_dataset')->nullable();
 
-            // Optional class name of an App\Services\RForce\Transformers\* implementation.
-            // When null, the system falls back to config('rforce.objects.{target_object}.transformer').
+            // Optional explicit class name of an
+            // App\Services\RForce\Transformers\* implementation. When null
+            // the system falls back to the dataset map in config/rforce.php.
             $table->string('transformer_class')->nullable();
 
             $table->boolean('enabled')->default(true);
@@ -39,7 +42,7 @@ return new class extends Migration
             $table->timestamps();
 
             $table->index(['enabled', 'schedule']);
-            $table->index('target_object');
+            $table->index('target_dataset');
         });
     }
 

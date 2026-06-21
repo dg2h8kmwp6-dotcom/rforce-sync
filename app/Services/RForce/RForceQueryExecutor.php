@@ -6,38 +6,67 @@ namespace App\Services\RForce;
 
 use App\Models\QueryDefinition;
 use App\Services\RForce\Contracts\RForceConnector;
-use App\Services\RForce\DTO\QueryResult;
+use App\Services\RForce\DTO\RForceQueryResult;
+use App\Services\RForce\DTO\RForceRecordPage;
 use DateTimeInterface;
 use Generator;
 use Illuminate\Support\Carbon;
 
 /**
- * Runs SOQL queries through the connector, taking care of pagination and the
- * incremental / limit conveniences callers reach for.
+ * Runs SOQL queries through the connector, taking care of pagination and a
+ * handful of placeholder/SOQL conveniences callers reach for.
  *
- * Sits above RForceClient (transport) and below RForceSyncManager
+ * Sits above RForceClient (HTTP transport) and below RForceSyncManager
  * (orchestration). Has no opinion about raw_rforce_records or sync state —
  * its only job is "give me the records this SOQL produces".
+ *
+ * Pagination follows Salesforce's `nextRecordsUrl` shape: when a result has
+ * `done = false`, the next call goes through queryMore() with the URL the
+ * gateway returned. The connector decides how to encode that on the wire.
  */
 class RForceQueryExecutor
 {
+    /**
+     * Tokens we recognize in QueryDefinition SOQL. Resolved at run time;
+     * never interpolated as raw user input — see resolvePlaceholders().
+     */
+    public const PLACEHOLDER_LAST_SYNC_AT = '{{last_sync_at}}';
+    public const PLACEHOLDER_NOW          = '{{now}}';
+
     public function __construct(
         private readonly RForceConnector $connector,
     ) {}
 
     /**
-     * Walk all pages for a SOQL statement, yielding one QueryResult per page.
-     *
-     * @return Generator<int, QueryResult>
+     * Execute a single SOQL statement and return the gateway's response as a
+     * RForceQueryResult. Does NOT follow `nextRecordsUrl` — use
+     * executePaginated() if you want every page.
      */
-    public function streamPages(string $soql, ?int $pageSize = null): Generator
+    public function execute(string $soql): RForceQueryResult
     {
-        $cursor = null;
-        do {
-            $page = $this->connector->executeSoql($soql, $cursor, $pageSize);
-            yield $page;
-            $cursor = $page->nextCursor;
-        } while ($cursor !== null);
+        return $this->connector->query($soql);
+    }
+
+    /**
+     * Walk all pages for a SOQL statement, yielding one RForceRecordPage per
+     * page. The first page comes from query(); subsequent pages come from
+     * queryMore() with the `nextRecordsUrl` returned by the previous page.
+     *
+     * @return iterable<int, RForceRecordPage>
+     */
+    public function executePaginated(string $soql): iterable
+    {
+        $pageNumber = 1;
+        $result     = $this->connector->query($soql);
+        yield RForceRecordPage::fromResult($result, $pageNumber);
+
+        while ($result->hasMore()) {
+            $pageNumber++;
+            /** @var string $nextRecordsUrl — guaranteed non-null by hasMore() */
+            $nextRecordsUrl = $result->nextRecordsUrl;
+            $result = $this->connector->queryMore($nextRecordsUrl);
+            yield RForceRecordPage::fromResult($result, $pageNumber);
+        }
     }
 
     /**
@@ -45,10 +74,10 @@ class RForceQueryExecutor
      *
      * @return Generator<int, array<string,mixed>>
      */
-    public function streamRecords(string $soql, ?int $maxRecords = null, ?int $pageSize = null): Generator
+    public function streamRecords(string $soql, ?int $maxRecords = null): Generator
     {
         $emitted = 0;
-        foreach ($this->streamPages($soql, $pageSize) as $page) {
+        foreach ($this->executePaginated($soql) as $page) {
             foreach ($page->records as $record) {
                 if ($maxRecords !== null && $emitted >= $maxRecords) {
                     return;
@@ -60,28 +89,24 @@ class RForceQueryExecutor
     }
 
     /**
-     * Run a single page, no pagination. Useful for `--dry-run`: caller gets
-     * totalSize plus the first batch of records to eyeball.
-     */
-    public function firstPage(string $soql, ?int $pageSize = null): QueryResult
-    {
-        return $this->connector->executeSoql($soql, null, $pageSize);
-    }
-
-    /**
-     * Resolve a QueryDefinition into the SOQL string that should actually run,
-     * after applying optional `since` (LastModifiedDate filter) and `limit`.
+     * Resolve a QueryDefinition into the SOQL string that should actually run:
+     * substitute supported `{{...}}` placeholders, append optional `since`
+     * (LastModifiedDate filter) and `limit` clauses.
      *
-     * Adding clauses by string concatenation is intentionally conservative; we
-     * only touch SOQL that doesn't already declare the clause. If a saved
-     * query already specifies LIMIT or WHERE LastModifiedDate, we leave it
-     * alone so the author's intent wins.
+     * Placeholder substitution is value-typed (ISO timestamps, integers) —
+     * raw user input is never spliced into SOQL.
      */
-    public static function buildSoql(QueryDefinition|string $source, ?DateTimeInterface $since = null, ?int $limit = null): string
-    {
-        $soql = trim($source instanceof QueryDefinition ? $source->soql : $source);
+    public static function buildSoql(
+        QueryDefinition|string $source,
+        ?DateTimeInterface $since = null,
+        ?int $limit = null,
+    ): string {
+        $definition = $source instanceof QueryDefinition ? $source : null;
+        $soql       = trim($source instanceof QueryDefinition ? $source->soql : $source);
         // Strip trailing semicolon if present — SOQL doesn't require it but humans add it.
         $soql = rtrim($soql, ';');
+
+        $soql = self::resolvePlaceholders($soql, $definition, $since);
 
         if ($since !== null) {
             $iso = Carbon::instance($since)->toIso8601String();
@@ -98,13 +123,44 @@ class RForceQueryExecutor
     }
 
     /**
+     * Replace recognized placeholders with SOQL-safe literal values.
+     *
+     * Supported:
+     *   {{last_sync_at}} → ISO-8601 timestamp; falls back to the explicit
+     *                      $since arg, then to QueryDefinition.last_run_at,
+     *                      then to a far-past sentinel.
+     *   {{now}}          → ISO-8601 timestamp at the moment of resolution.
+     *
+     * Unknown placeholders are left untouched so the SOQL fails loudly at the
+     * gateway rather than silently stripping content.
+     */
+    public static function resolvePlaceholders(
+        string $soql,
+        ?QueryDefinition $definition = null,
+        ?DateTimeInterface $since = null,
+    ): string {
+        if (! str_contains($soql, '{{')) {
+            return $soql;
+        }
+
+        $lastSync = $since
+            ?? $definition?->last_run_at
+            ?? Carbon::createFromTimestamp(0);
+        $lastSyncIso = Carbon::instance($lastSync)->toIso8601String();
+        $nowIso      = Carbon::now()->toIso8601String();
+
+        return strtr($soql, [
+            self::PLACEHOLDER_LAST_SYNC_AT => $lastSyncIso,
+            self::PLACEHOLDER_NOW          => $nowIso,
+        ]);
+    }
+
+    /**
      * Append a predicate to the WHERE clause (or create one) without disturbing
      * an existing ORDER BY / LIMIT.
      */
     private static function injectWhere(string $soql, string $predicate): string
     {
-        // Find the position of the first ORDER BY or LIMIT, if any — predicate
-        // must land before them.
         $tail = '';
         if (preg_match('/\b(ORDER\s+BY|LIMIT|OFFSET)\b/i', $soql, $m, PREG_OFFSET_CAPTURE)) {
             $offset = $m[0][1];
